@@ -3,8 +3,8 @@
 > Selected checkpoints. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs.
+single `sm_120a` NVIDIA GPU (GeForce RTX 5090 or RTX PRO 6000 Blackwell). It runs text, image, and
+video prompts through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
@@ -122,7 +122,7 @@ notes.
 NInfer currently requires:
 
 - 64-bit Linux;
-- NVIDIA GeForce RTX 5090 (`sm_120a`);
+- an `sm_120a` NVIDIA GPU: GeForce RTX 5090 or RTX PRO 6000 Blackwell;
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
@@ -131,8 +131,51 @@ NInfer currently requires:
 - `libcurl >= 7.85`;
 - Ninja, when using the commands below.
 
-The build rejects CUDA architectures other than `120a`. There is no install target or packaged
-binary distribution; NInfer is run from its source build tree.
+The build rejects CUDA architectures other than `120a`. Persistent and cooperative kernels size
+their launch geometry from the live device's multiprocessor count, so a wider `sm_120a` part is
+filled without a rebuild; the published performance figures and the measured schedule-selection
+tables remain RTX 5090 campaigns. There is no install target or packaged binary distribution;
+NInfer is run from its source build tree.
+
+### Host packages
+
+On Debian/Ubuntu, the host-side requirements above are:
+
+```bash
+sudo apt install build-essential cmake ninja-build pkg-config \
+  libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+  libcurl4-openssl-dev
+```
+
+`build-essential` supplies the C++20 host compiler, and `ninja-build` is required by the
+`-G Ninja` commands below. Ninja is not merely a convenience here: the CUDA device-link step is
+memory-hungry, and the Ninja generator places those links in a serialized `cuda_link` job pool.
+Under other generators an unbounded parallel build can exhaust host RAM while linking.
+
+Verify the FFmpeg and libcurl versions satisfy the minimums above, since older distributions ship
+FFmpeg below the required `libavformat >= 60`:
+
+```bash
+pkg-config --modversion libavformat libavcodec libavutil libswscale libcurl
+```
+
+### CUDA toolkit
+
+Install CUDA 13.1 or newer from NVIDIA's repositories; the distribution's own `nvidia-cuda-toolkit`
+package is usually too old to emit `sm_120a`. If a second, older `nvcc` is present on `PATH` (for
+example `/usr/bin/nvcc` from a distribution package), CMake selects it and configuration fails with:
+
+```text
+nvcc fatal   : Unsupported gpu architecture 'compute_120a'
+```
+
+Point the build at the correct toolkit explicitly, either by exporting `CUDACXX` or by putting the
+toolkit first on `PATH`:
+
+```bash
+export CUDACXX=/usr/local/cuda/bin/nvcc     # or: export PATH=/usr/local/cuda/bin:$PATH
+nvcc --version                              # confirm release 13.1 or newer
+```
 
 ## Build
 
@@ -143,6 +186,9 @@ cd ninfer
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
+
+If configuration reports an unsupported `compute_120a`, the wrong `nvcc` was selected; set
+`CUDACXX` as shown above and configure again into a clean build directory.
 
 The default configuration builds:
 
@@ -155,7 +201,7 @@ Tests, benchmarks, and maintainer tools are excluded from the default build.
 
 ## Docker
 
-Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
+Build the runtime image on a 64-bit Linux host with an `sm_120a` GPU, a CUDA 13.1-compatible NVIDIA
 driver, Docker, and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
@@ -319,8 +365,8 @@ from one to fifteen.
 
 - Only the five `(model_id, weights_id)` artifact identities listed above are accepted product
   identities.
-- Execution is specialized for one RTX 5090 and one CUDA device.
-- One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
+- Execution is specialized for one `sm_120a` GPU and one CUDA device.
+- One Engine owns one resident model and supports a startup-fixed capacity of 1–16 active requests.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,

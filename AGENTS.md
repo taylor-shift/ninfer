@@ -108,16 +108,23 @@ NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU infere
 a small set of explicitly registered checkpoint artifacts. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
 `qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
-for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
+for `sm_120a` and runs on any compute-capability 12.0 device. All identities execute Text,
 image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
 same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
 
-The current workload is one GPU and one resident model instance with a startup-fixed one to eight
+Supported devices are the `sm_120a` family, currently NVIDIA GeForce RTX 5090 and RTX PRO 6000
+Blackwell. Launch geometry for persistent and cooperative kernels is derived from the live device's
+multiprocessor count rather than a fixed constant, so a wider part fills every SM. Published
+performance results and the measured schedule-selection tables in `src/ops` remain RTX 5090
+campaigns: they stay correct on a wider device but are no longer optimal there, and re-measuring
+them for another `sm_120a` part is a separate, explicitly requested task. Retargeting to a
+different compute capability or to a non-NVIDIA platform remains outside the current product.
+
+The current workload is one GPU and one resident model instance with a startup-fixed one to sixteen
 active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
-scheduling, additional checkpoint targets, and retargeting the implementation to another execution
-platform are outside the current product. This is a local, single-owner project. Registered models,
-generated artifacts, and the local workflow are trusted.
+scheduling, and additional checkpoint targets are outside the current product. This is a local,
+single-owner project. Registered models, generated artifacts, and the local workflow are trusted.
 Requirements derived from a different workload, trust model, or deployment model are out of scope
 until that product contract is explicitly changed.
 
