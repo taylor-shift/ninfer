@@ -1,9 +1,33 @@
-# COPY . . in deploy/multi-gpu/Dockerfile brings the checkout into the builder;
-# keep local build output and VCS metadata out so the layer stays small and
-# cache-stable.
 .git
-build/
-*/build/
-.cache/
+.cache
+.claude
+.codex
+.idea
+.pytest_cache
+.vscode
+
+build
+build-*
+cmake-build-*
+eval/runs
+eval/server-logs
+out
+profiles
+logs
+models
+
+**/__pycache__
+**/.venv
+**/venv
+
+*.bin
+*.gguf
+*.log
+*.ncu-rep
 *.ninfer
-*.tgz
+*.nsys-rep
+*.pyc
+*.qdrep
+*.qus
+*.safetensors
+*.sqlite
