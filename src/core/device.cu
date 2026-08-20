@@ -141,6 +141,14 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     return *this;
 }
 
+void DeviceContext::bind_current_thread() const {
+    // Fast path: most calls land on a thread that is already bound. Querying
+    // first keeps the common case to a single cheap driver call.
+    int current = -1;
+    if (cudaGetDevice(&current) == cudaSuccess && current == device) { return; }
+    CUDA_CHECK(cudaSetDevice(device));
+}
+
 int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; }
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }

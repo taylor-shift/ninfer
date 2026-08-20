@@ -157,12 +157,17 @@ runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,
                                      runtime::TransientRegion transient) {
+    // The HTTP server runs each request on its own thread, and cudaSetDevice is
+    // per-thread: without this the launch below targets device 0 regardless of
+    // which GPU this engine owns.
+    DeviceGuard guard(impl_->device);
     return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
                                      std::move(plan), transient);
 }
 
 template <>
 runtime::PrefillStepResult Program<Variant>::advance_prefill_lane(std::uint32_t lane) {
+    DeviceGuard guard(impl_->device);
     return impl_->advance_prefill_lane(lane);
 }
 
@@ -170,6 +175,7 @@ template <>
 runtime::BatchedGeneratedRound
 Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
                                std::span<const runtime::RoundBudget> budgets) {
+    DeviceGuard guard(impl_->device);
     return impl_->decode_batch(lanes, budgets);
 }
 
