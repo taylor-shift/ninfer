@@ -74,28 +74,52 @@ C=4 at 232,000 context, and reproduces both to within 0.03%. Override it with
 ## Build and push
 
 ```bash
-docker build -f deploy/runpod/Dockerfile -t <user>/ninfer-runpod:latest .
-docker push <user>/ninfer-runpod:latest
+docker build -f deploy/runpod/Dockerfile -t <user>/ninfer-runpod:v1.0 .
+docker push <user>/ninfer-runpod:v1.0
 ```
+
+Tag releases with a version rather than deploying `:latest`. A mutable tag makes
+deployments unpredictable, complicates rollback, and interacts badly with RunPod's
+image caching, since a cached host may hold a different image under the same name.
 
 The build compiles for `sm_120a` only, so the image runs exclusively on compute
 capability 12.0 devices. The entrypoint checks this and fails with a clear message
 rather than letting the engine abort deep in startup.
 
-## Create the endpoint
+## Templates
 
-In the RunPod console, **Serverless → New Endpoint → Import from Docker Registry**:
+Two serverless templates exist for this image. Each pins the version tag, exposes
+port 80, and carries the environment an endpoint needs; the only difference is
+`NINFER_PROFILE`.
+
+| Template | ID | Profile | Pair with GPU pool |
+|---|---|---|---|
+| `ninfer-standard` | `xcmdo0h3j5` | `standard` | `ADA_32_PRO` (RTX 5090) |
+| `ninfer-highconc` | `f4sz9sgcwj` | `highconc` | `BLACKWELL_96` (RTX PRO 6000) |
+
+Both set `containerDiskInGb: 30` and `volumeInGb: 0`. No volume is needed because
+the cached model arrives on `/runpod-volume` independently, and the container disk
+only holds the 4.4 GiB image plus logs.
+
+Recreate or update them with `saveTemplate`, whose required fields are `name`,
+`imageName`, `containerDiskInGb`, `volumeInGb`, `dockerArgs`, and `env`. Passing an
+existing `id` updates that template in place instead of creating another. Leave
+`dockerArgs` empty so the image's own `ENTRYPOINT` runs.
+
+## Create the endpoint
 
 The console is the simplest route, and the GraphQL API can do the same thing
 unattended; see [Scripted creation](#scripted-creation) below. Note that the REST v2
 API cannot: its `CreateEndpointRequest` has no model field, so an endpoint created
 that way has no cached model and re-downloads the artifact on every cold start.
 
-**Serverless → New Endpoint → Import from Docker Registry**:
+In the console, **Serverless → New Endpoint**, then select one of the templates
+above rather than importing the image again:
 
 1. **Endpoint type:** Load balancing. (Queue-based would serialize requests per
    worker unless you write an async handler, wasting the engine's own batching.)
-2. **Image:** `lroel/ninfer-runpod:latest`.
+2. **Template:** `ninfer-standard` or `ninfer-highconc`, which already carry the
+   image, port, and environment.
 3. **GPU:** the 32 GB tier (`ADA_32_PRO`) for `standard`, or the 96 GB tier
    (`BLACKWELL_96`) for `highconc`. Both contain only sm_120a parts, so any worker
    the scheduler picks can run this image.
@@ -118,7 +142,7 @@ counts, and logs.
 | Console field | `standard` (burst offload) | `highconc` |
 |---|---|---|
 | Endpoint type | Load balancing | Load balancing |
-| Image | `lroel/ninfer-runpod:latest` | same |
+| Image | `lroel/ninfer-runpod:v1.0` | same |
 | GPU | RTX 5090 (32 GB) | RTX PRO 6000 (96 GB) |
 | Model | `neroued/Qwen3.8-27B-nvfp4-NInfer` | same |
 | Max workers | 2–3 | 2–3 |
@@ -156,7 +180,7 @@ curl -s -X POST https://api.runpod.io/graphql \
        "variables":{"i":{
          "name":"ninfer-standard",
          "type":"LB",
-         "templateId":"<TEMPLATE_ID>",
+         "templateId":"xcmdo0h3j5",
          "gpuIds":"ADA_32_PRO",
          "modelReferences":["neroued/Qwen3.8-27B-nvfp4-NInfer"],
          "workersMin":0, "workersMax":3, "idleTimeout":300,
