@@ -17,7 +17,14 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency = 8;
+// Startup-fixed ceiling on simultaneously admitted requests.
+//
+// This sizes the fixed round-state transfer blocks and the per-batch CUDA Graph families, which
+// are instantiated once for every batch size in [1,kMaximumConcurrency]; graph memory and startup
+// cost therefore grow with this bound. Decode presents batch*width aggregate columns to the token
+// axis, so raising it moves wide decode rounds off the fused GDN control schedules (T<=16) and
+// onto their general fallbacks. Both effects are performance, not correctness.
+inline constexpr std::uint32_t kMaximumConcurrency = 16;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;

@@ -129,7 +129,9 @@ For DFlash:
 MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
 use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
 the optimized proposal head. DFlash accepts up to fifteen draft tokens; seven is the current
-measured recommendation rather than a semantic limit.
+measured recommendation rather than a semantic limit. DFlash also caps concurrency at eight active
+requests, because its decode leaves register an exact `B=1..8` domain; ordinary and MTP decode
+accept the full sixteen.
 
 ## Common options
 

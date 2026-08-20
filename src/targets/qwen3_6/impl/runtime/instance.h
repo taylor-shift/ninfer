@@ -39,6 +39,12 @@ inline constexpr std::uint32_t kPrefillChunkAlignment    = Variant::prefill_chun
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = Variant::maximum_mtp_draft_tokens;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = Variant::maximum_dflash_draft_tokens;
 
+// DFlash decode is bounded below kMaximumConcurrency by its execution leaves: swa,
+// bidirectional_gqa_attention, prepare_masked_block, and kv_cache_append_prefix all register an
+// exact B=1..8 domain and reject a wider batch outright. Ordinary and MTP decode have no such
+// bound. Raising this requires widening those registered Op domains, not just this constant.
+inline constexpr std::uint32_t kMaximumDFlashConcurrency = 8;
+
 inline std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity) {
     return Variant::ordinary_graph_profiles(capacity);
 }
