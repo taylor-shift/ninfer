@@ -1,0 +1,118 @@
+# syntax=docker/dockerfile:1
+#
+# ninfer multi-GPU image, built from source.
+#
+# Stage 1 compiles ninfer-serve from the fork; stage 2 ships only the binary.
+# nvcc is a BUILD-time dependency only: ninfer compiles every kernel ahead of
+# time (no NVRTC, no cuModuleLoad anywhere in the tree — that is also why CMake
+# hard-pins CMAKE_CUDA_ARCHITECTURES=120a). The runtime image needs just
+# libcudart plus the host driver, so shipping from -runtime costs nothing in
+# size and keeps the compiler out of a production container.
+#
+# Build from the REPOSITORY ROOT (the build context is the checkout itself, so
+# the image always matches the tree it was built from):
+#
+#   docker build -f deploy/multi-gpu/Dockerfile -t <user>/ninfer-pod-multi:vN .
+
+FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        cmake \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libcurl4-openssl-dev \
+        libswscale-dev \
+        ninja-build \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# Carries fix(core) 6949d45c: DeviceContext::bind_current_thread() + DeviceGuard
+# at the Program CUDA entry points, so `--device N` works on a multi-GPU host.
+# Before it, every engine off GPU 0 died in warmup with cudaErrorInvalidValue at
+# gqa_attention_prefill.cu:58 and CUDA_VISIBLE_DEVICES isolation was mandatory.
+RUN cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DNINFER_BUILD_APPS=ON \
+        -DBUILD_TESTING=OFF \
+        -DNINFER_BUILD_BENCHMARKS=OFF \
+    && cmake --build /build --parallel --target ninfer-serve
+
+
+FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# aria2/python3 back the artifact fetcher; openssh-server makes the mapped
+# 22/tcp usable for inspecting a wedged instance; perl runs the balancer.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        aria2 \
+        ca-certificates \
+        curl \
+        libavcodec60 \
+        libavformat60 \
+        libavutil58 \
+        libcurl4t64 \
+        libswscale7 \
+        openssh-server \
+        perl \
+        python3-minimal \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# hf-xet is the transfer path for this Xet-backed repo; hf_transfer is the
+# fallback for plain LFS. huggingface_hub 1.x DROPPED the [hf_transfer] extra,
+# so naming them as separate packages is required — the import check below makes
+# a silent regression fail the build instead of the download.
+RUN pip3 install --no-cache-dir --break-system-packages \
+        huggingface_hub hf-xet hf_transfer \
+    && rm -rf /root/.cache/pip \
+    && python3 -c "import huggingface_hub, hf_xet, hf_transfer; print('hub', huggingface_hub.__version__, 'xet+transfer ok')"
+
+RUN mkdir -p /var/run/sshd /root/.ssh /var/log/ninfer \
+    && chmod 700 /root/.ssh \
+    && ssh-keygen -A \
+    && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY deploy/multi-gpu/entrypoint.sh     /usr/local/bin/ninfer-multi-entrypoint
+COPY deploy/multi-gpu/balancer.pl       /usr/local/bin/ninfer-balancer
+COPY deploy/multi-gpu/fetch-artifact.sh /usr/local/bin/ninfer-fetch-artifact
+
+RUN chmod +x /usr/local/bin/ninfer-serve \
+             /usr/local/bin/ninfer-multi-entrypoint \
+             /usr/local/bin/ninfer-balancer \
+             /usr/local/bin/ninfer-fetch-artifact
+
+# Split fleet by default: text engines keep the full context, the last two cards
+# run --vision at the reduced ceiling that fits alongside its fixed allocations.
+ENV PORT=8000 \
+    NINFER_VOLUME_PATH=/workspace \
+    NINFER_ARTIFACT=qwen3_8_27b_nvfp4.ninfer \
+    NINFER_ARTIFACT_SHA256=bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32 \
+    NINFER_VISION=1 \
+    NINFER_TEXT_CONTEXT=262144 \
+    NINFER_VISION_CONTEXT=196608 \
+    NINFER_MAX_CONCURRENCY=2 \
+    NINFER_KV_DTYPE=int8 \
+    NINFER_SPEC=mtp \
+    NINFER_DRAFT_TOKENS=3 \
+    NINFER_START_STAGGER_S=5 \
+    NINFER_SHUTDOWN_GRACE_S=30 \
+    HF_XET_HIGH_PERFORMANCE=1 \
+    NINFER_ENABLE_SSHD=1 \
+    NINFER_ALLOW_ARIA2=0
+
+EXPOSE 8000 8001 22
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/ninfer-multi-entrypoint"]
