@@ -86,19 +86,19 @@ rather than letting the engine abort deep in startup.
 
 In the RunPod console, **Serverless → New Endpoint → Import from Docker Registry**:
 
-Create the endpoint in the **console**, not through the API. The cached-model field
-exists only in the console UI: neither the REST v2 `CreateEndpointRequest` schema nor
-the public GraphQL API carries a model or cache field, so an endpoint created through
-either has no cached model and would download the artifact on every cold start.
+The console is the simplest route, and the GraphQL API can do the same thing
+unattended; see [Scripted creation](#scripted-creation) below. Note that the REST v2
+API cannot: its `CreateEndpointRequest` has no model field, so an endpoint created
+that way has no cached model and re-downloads the artifact on every cold start.
 
 **Serverless → New Endpoint → Import from Docker Registry**:
 
 1. **Endpoint type:** Load balancing. (Queue-based would serialize requests per
    worker unless you write an async handler, wasting the engine's own batching.)
 2. **Image:** `lroel/ninfer-runpod:latest`.
-3. **GPU:** restrict to `RTX 5090` for `standard`, or `RTX PRO 6000` for `highconc`.
-   Note the 32 GB tier also contains the RTX PRO 4500 Blackwell, which is a much
-   smaller part; select GPU types explicitly rather than by memory size alone.
+3. **GPU:** the 32 GB tier (`ADA_32_PRO`) for `standard`, or the 96 GB tier
+   (`BLACKWELL_96`) for `highconc`. Both contain only sm_120a parts, so any worker
+   the scheduler picks can run this image.
 4. **CUDA version:** select 13.1 and every newer version offered.
 5. **Model:** the Hugging Face repo id from the table above. This is the field that
    enables caching; it must match `NINFER_MODEL`.
@@ -110,8 +110,8 @@ either has no cached model and would download the artifact on every cold start.
 `ninfer-serve` does not serve; without it workers never report healthy and return
 502 after eight minutes.
 
-Once an endpoint exists, the REST API is useful for everything else — scaling,
-worker counts, and logs — since only the model field is console-only.
+Once an endpoint exists, the REST v2 API handles everything else — scaling, worker
+counts, and logs.
 
 ### Endpoint settings by profile
 
@@ -138,6 +138,53 @@ NINFER_PROFILE=standard          # or: highconc
 `NINFER_PROFILE` may be left at `auto`, which selects by VRAM; naming it explicitly
 makes the endpoint's intent obvious and prevents a surprise if it ever schedules onto
 a different card.
+
+### Scripted creation
+
+The cached model is reachable from the GraphQL API as `modelReferences` on
+`EndpointInput`, so both profiles can be created without the console. The REST v2 API
+has no equivalent field.
+
+```bash
+# Never commit this key; export it in the shell that runs the request.
+read -rsp 'RunPod API key: ' RP_KEY; echo
+
+curl -s -X POST https://api.runpod.io/graphql \
+  -H "Authorization: Bearer $RP_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"mutation($i:EndpointInput!){saveEndpoint(input:$i){id name}}",
+       "variables":{"i":{
+         "name":"ninfer-standard",
+         "type":"LB",
+         "templateId":"<TEMPLATE_ID>",
+         "gpuIds":"ADA_32_PRO",
+         "modelReferences":["neroued/Qwen3.8-27B-nvfp4-NInfer"],
+         "workersMin":0, "workersMax":3, "idleTimeout":300,
+         "minCudaVersion":"13.1"
+       }}}'
+```
+
+Field notes, confirmed against the live API:
+
+- `type` takes `LB` or `QB` here, not the REST spelling `LOAD_BALANCER`/`QUEUE`.
+- `gpuIds` is required for a GPU endpoint and takes **pool IDs**, not display names.
+  Use `ADA_32_PRO` for `standard` and `BLACKWELL_96` for `highconc`. Both pools
+  contain only sm_120a parts, verified by probing pool membership: `ADA_32_PRO`
+  holds the RTX 5090 alone, and `BLACKWELL_96` holds the three RTX PRO 6000
+  Blackwell variants, which share one CUDA target. No exclusions are needed; to
+  drop a member from a pool anyway, prefix its GPU id with `-`.
+- `templateId` supplies the image, ports, and environment variables. Create the
+  template first (console, or `saveTemplate`), since `EndpointInput` carries no
+  `image` or `containerDiskInGb` field of its own.
+- `modelReferences` is a list, but an endpoint caches one model at a time.
+
+Verify afterwards, and watch `modelStatus` rather than assuming the cache is warm:
+
+```bash
+curl -s -X POST https://api.runpod.io/graphql \
+  -H "Authorization: Bearer $RP_KEY" -H 'Content-Type: application/json' \
+  -d '{"query":"{myself{endpoints{id name type modelReferences modelStatus}}}"}'
+```
 
 ### Cold starts
 
