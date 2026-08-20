@@ -51,8 +51,11 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
     if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
-    // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
-    // one 170-SM wave after accounting for the geometry's KV-head count.
+    // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below one device wave
+    // after accounting for the geometry's KV-head count. This clamp is a measured tuning frontier
+    // that also sizes the decode partial workspace, so it stays a fixed constant: plan time and
+    // launch time must agree. A wider device leaves some SMs idle in this path until the frontier
+    // is re-measured.
     if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;

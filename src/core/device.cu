@@ -42,6 +42,33 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
+int sm_count() noexcept {
+    // Queried once per process. Every persistent/cooperative launch geometry derives from this, so
+    // a per-launch-variable value would change grid dimensions mid-run and break CUDA Graph replay;
+    // the function-local static gives thread-safe one-time initialization.
+    static const int count = [] {
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        int value = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device));
+        if (value <= 0) {
+            std::fprintf(stderr, "device reports a nonpositive SM count: %d\n", value);
+            std::abort();
+        }
+        return value;
+    }();
+    return count;
+}
+
+int resident_cta_target(int ctas_per_sm) noexcept {
+    if (ctas_per_sm <= 0) {
+        std::fprintf(stderr, "resident_cta_target requires a positive CTA/SM count: %d\n",
+                     ctas_per_sm);
+        std::abort();
+    }
+    return sm_count() * ctas_per_sm;
+}
+
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
     int count       = 0;
     cudaError_t err = cudaGetDeviceCount(&count);

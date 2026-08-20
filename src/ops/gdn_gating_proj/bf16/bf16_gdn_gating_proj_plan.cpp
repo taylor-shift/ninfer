@@ -1,5 +1,6 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
+#include "core/device.h"
 #include "ninfer/ops/rmsnorm.h"
 
 #include <algorithm>
@@ -123,20 +124,24 @@ bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t
     return grid_ctas <= resident_ctas;
 }
 
+// These schedules launch cooperatively and synchronize the whole grid, so a grid that exceeds the
+// device's resident CTA capacity deadlocks. The per-SM occupancy below is a property of the
+// compiled register and shared-memory footprint and holds across sm_120 parts; only the SM count
+// varies, so the device-wide limit is derived from the live device.
 bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
-    // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
-    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
+    // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM.
+    // There are three 16-row tiles per token tile.
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, resident_cta_target(2));
 }
 
 bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
     // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
     // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
-    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
-    // device-wide limits are 340 and 680 CTAs respectively.
+    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM.
     const std::int32_t resident_ctas =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? resident_cta_target(2)
+                                                                   : resident_cta_target(4);
     return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
 }
 
