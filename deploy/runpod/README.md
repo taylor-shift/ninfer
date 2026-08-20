@@ -86,6 +86,25 @@ The build compiles for `sm_120a` only, so the image runs exclusively on compute
 capability 12.0 devices. The entrypoint checks this and fails with a clear message
 rather than letting the engine abort deep in startup.
 
+## Live endpoint
+
+| Field | Value |
+|---|---|
+| Name | `ninfer-standard` |
+| ID | `galy9umimp1piy` |
+| URL | `https://galy9umimp1piy.api.runpod.ai` |
+| Type | `LB` (load balancing) |
+| GPU | `ADA_32_PRO` → NVIDIA GeForce RTX 5090 |
+| Template | `xcmdo0h3j5` |
+| Cached model | `neroued/Qwen3.8-27B-nvfp4-NInfer` |
+| FlashBoot | enabled |
+| Workers | min 0, max 2, idle timeout 300s |
+| Scaling | `REQUEST_COUNT`, 4 in flight per worker |
+
+`workersMin: 0` is what makes the endpoint scale to zero; the `workersStandby` value
+reported alongside it tracks `workersMax` and is the pool size, not a count of
+always-on workers.
+
 ## Templates
 
 Two serverless templates exist for this image. Each pins the version tag, exposes
@@ -166,9 +185,19 @@ a different card.
 
 ### Scripted creation
 
-The cached model is reachable from the GraphQL API as `modelReferences` on
-`EndpointInput`, so both profiles can be created without the console. The REST v2 API
-has no equivalent field.
+Creating an endpoint takes both APIs, because neither is sufficient alone:
+
+- **GraphQL `saveEndpoint`** owns the two fields that matter most here. `type: "LB"`
+  selects load balancing, and `modelReferences` attaches the cached model; RunPod
+  resolves the repo id to a pinned commit, so the reference stored on the endpoint
+  carries a hash. The deployed REST create has no field for either.
+- **REST `PATCH /v1/endpoints/{id}`** owns `flashboot`, which `EndpointInput` does
+  not expose.
+
+So: create with GraphQL, then PATCH FlashBoot on. Note the deployed REST schema is
+flatter than its published documentation — `gpuTypeIds` and `workersMax` rather than
+nested `gpu`/`workers` objects, and `flashboot` is a boolean rather than the
+documented `OFF`/`FLASHBOOT` enum.
 
 ```bash
 # Never commit this key; export it in the shell that runs the request.
@@ -184,9 +213,15 @@ curl -s -X POST https://api.runpod.io/graphql \
          "templateId":"xcmdo0h3j5",
          "gpuIds":"ADA_32_PRO",
          "modelReferences":["neroued/Qwen3.8-27B-nvfp4-NInfer"],
-         "workersMin":0, "workersMax":3, "idleTimeout":300,
+         "workersMin":0, "workersMax":2, "idleTimeout":300,
+         "scalerType":"REQUEST_COUNT", "scalerValue":4,
          "minCudaVersion":"13.1"
        }}}'
+
+# FlashBoot is not on EndpointInput; enable it on the created endpoint.
+curl -s -X PATCH "https://rest.runpod.io/v1/endpoints/<ENDPOINT_ID>" \
+  -H "Authorization: Bearer $RP_KEY" -H 'Content-Type: application/json' \
+  -d '{"flashboot": true}'
 ```
 
 Field notes, confirmed against the live API:
