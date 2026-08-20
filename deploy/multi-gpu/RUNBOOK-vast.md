@@ -141,3 +141,42 @@ later as `text/layers/0/mlp/gate_up: divisor must be finite and positive`.
 - decode **160–167 tok/s** per stream
 - MTP: 3.27–3.48 tokens/round, **75–83% acceptance**
 - model load **~3.8 s** from local NVMe
+
+---
+
+## RunPod (alternative to Vast)
+
+The same image runs on RunPod; only the provisioning differs.
+
+**Template `g9xde4knct` — `ninfer-multi-5090`** (`lroel/ninfer-pod-multi:v6`,
+20 GB container disk + 40 GB volume at `/workspace`, ports 8000/8001/22).
+
+```bash
+runpodctl pod create --template-id g9xde4knct \
+  --name ninfer-8x5090 \
+  --gpu-id "NVIDIA GeForce RTX 5090" --gpu-count 8 \
+  --min-cuda-version 13.1 \
+  --env '{"NINFER_API_KEY":"<key>"}' \
+  --stop-after "$(date -u -d '+12 hours' +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+`--min-cuda-version 13.1` is mandatory: ninfer's CMake floor is CUDA 13.1 and
+GeForce cards have no forward compatibility, so a 13.0 host cannot run the
+image at all.
+
+### Differences that matter
+
+| | Vast | RunPod |
+|---|---|---|
+| 8×5090 availability | listed regularly | **often unavailable** — 4× scheduled fine, 8× returned "no longer any instances" |
+| ~4×5090 price | — | ~$3.96/hr |
+| Container disk across stop/start | persists | **wiped** — only the volume survives |
+| Host port | stable across stop/start | **rotates on every restart** |
+| HTTP access | published host port | `https://<pod-id>-8000.proxy.runpod.net` (Cloudflare; send `User-Agent: curl/8.5.0` or requests are 403'd) |
+
+Because RunPod wipes the container disk on stop, the volume mount is not
+optional there — without it the 21.5 GB artifact re-downloads on every start.
+
+If 8 GPUs are unavailable, the fleet scales down cleanly: engine count follows
+the visible GPU count, and `NINFER_TEXT_ENGINES` controls the text/vision split
+(e.g. `NINFER_TEXT_ENGINES=3` on a 4-GPU pod gives 3 text + 1 vision).
