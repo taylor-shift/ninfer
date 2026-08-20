@@ -20,6 +20,59 @@ fail() { log "ERROR: $*"; exit 1; }
 
 HF_CACHE_ROOT="${HF_CACHE_ROOT:-/runpod-volume/huggingface-cache/hub}"
 
+# --- 0. Answer health probes immediately ------------------------------------
+
+# The load balancer starts polling as soon as the container exists and reads a
+# refused connection as unhealthy, so the port must answer before any slow work:
+# waiting for the cached model, loading 20+ GiB of weights, and capturing CUDA
+# Graphs all happen after this point and together take minutes.
+port="${PORT:-80}"
+health_port="${PORT_HEALTH:-$port}"
+if [[ "$health_port" == "$port" ]]; then
+    engine_port="${NINFER_INTERNAL_PORT:-18080}"
+else
+    engine_port="$port"
+fi
+
+# Readiness gate. Bind the health port now so the balancer sees 204 (initializing)
+# instead of a refused connection, and keep answering until the engine reports 200.
+# Perl is already present in the runtime image, so this needs no extra package.
+readiness_gate() {
+    perl -e '
+        use IO::Socket::INET;
+        my ($hport, $eport, $path) = @ARGV;
+        my $srv = IO::Socket::INET->new(
+            LocalAddr => "0.0.0.0", LocalPort => $hport, Listen => 128,
+            Proto => "tcp", ReuseAddr => 1) or die "bind $hport: $!\n";
+        # Stop as soon as the engine answers its own health route.
+        my $ready = 0;
+        while (!$ready) {
+            my $c = $srv->accept or next;
+            my $probe = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $eport,
+                                              Proto => "tcp", Timeout => 2);
+            if ($probe) {
+                print $probe "GET $path HTTP/1.0\r\nHost: localhost\r\n\r\n";
+                my $resp = <$probe>; close $probe;
+                $ready = 1 if defined $resp && $resp =~ m{ 200 };
+            }
+            # 204 keeps the worker in the pool while it loads; 200 hands over.
+            my $code = $ready ? "200 OK" : "204 No Content";
+            print $c "HTTP/1.1 $code\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            close $c;
+        }
+        exit 0;
+    ' "$1" "$2" "$3"
+}
+
+log "readiness gate on :${health_port} -> engine :${engine_port}"
+readiness_gate "$health_port" "$engine_port" "${NINFER_HEALTH_PATH:-/health}" &
+gate_pid=$!
+
+# Stop the gate with the container, so a failure here cannot leave a port bound
+# and a worker looking healthy while nothing serves it.
+trap 'kill "$gate_pid" 2>/dev/null || true' EXIT
+
+
 # --- 1. Locate the artifact -------------------------------------------------
 
 # NINFER_ARTIFACT_PATH bypasses discovery entirely, for an artifact baked into the
@@ -32,34 +85,68 @@ if [[ -z "$artifact" ]]; then
 
     # The cache directory replaces the '/' in a repo id with '--'.
     model_root="${HF_CACHE_ROOT}/models--${model//\//--}"
+
+    # A worker can start before its cached model is on the host: the volume may not be
+    # mounted yet, or the model may still be downloading. Exiting here would kill the
+    # container, and the platform would immediately rent another worker that fails the
+    # same way, so wait for the cache instead of failing fast.
+    #
+    # The wait is bounded by RUNPOD_INIT_TIMEOUT, which is the same budget the platform
+    # allows for cold start, minus a margin for the engine's own load.
+    cache_wait="${NINFER_CACHE_WAIT_S:-$(( ${RUNPOD_INIT_TIMEOUT:-800} / 2 ))}"
+    if [[ ! -d "$model_root" ]]; then
+        log "waiting up to ${cache_wait}s for cached model '$model' to appear at $model_root"
+        waited=0
+        while [[ ! -d "$model_root" ]] && (( waited < cache_wait )); do
+            sleep 5
+            waited=$(( waited + 5 ))
+            (( waited % 60 == 0 )) && log "  still waiting for the cache (${waited}s)"
+        done
+    fi
     [[ -d "$model_root" ]] || fail \
-        "cached model '$model' not found at $model_root. Set it as the endpoint's cached model, or set NINFER_ARTIFACT_PATH."
+        "cached model '$model' did not appear at $model_root within ${cache_wait}s. Confirm the endpoint's Model field is set to '$model', or set NINFER_ARTIFACT_PATH."
 
-    # refs/main names the materialized snapshot; fall back to the newest snapshot
-    # directory when that file is absent.
-    snapshot=""
-    if [[ -f "${model_root}/refs/main" ]]; then
-        candidate="${model_root}/snapshots/$(<"${model_root}/refs/main")"
-        [[ -d "$candidate" ]] && snapshot="$candidate"
-    fi
-    if [[ -z "$snapshot" ]]; then
-        snapshot=$(find "${model_root}/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
-            sort | tail -1)
-    fi
-    [[ -n "$snapshot" && -d "$snapshot" ]] || fail "no snapshot directory under $model_root"
+    # The directory can exist while the download is still in flight, so resolve the
+    # snapshot and the artifact inside the same bounded wait.
+    resolve_artifact() {
+        local snap="" cand
+        if [[ -f "${model_root}/refs/main" ]]; then
+            cand="${model_root}/snapshots/$(<"${model_root}/refs/main")"
+            [[ -d "$cand" ]] && snap="$cand"
+        fi
+        if [[ -z "$snap" ]]; then
+            snap=$(find "${model_root}/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null |
+                sort | tail -1)
+        fi
+        [[ -n "$snap" && -d "$snap" ]] || return 1
+        snapshot="$snap"
 
-    if [[ -n "${NINFER_ARTIFACT:-}" ]]; then
-        artifact="${snapshot}/${NINFER_ARTIFACT}"
-    else
+        if [[ -n "${NINFER_ARTIFACT:-}" ]]; then
+            [[ -e "${snap}/${NINFER_ARTIFACT}" ]] || return 1
+            artifact="${snap}/${NINFER_ARTIFACT}"
+            return 0
+        fi
         # Repos publish exactly one .ninfer artifact; more than one is ambiguous.
-        mapfile -t found < <(find "$snapshot" -maxdepth 1 -type f -name '*.ninfer' -o \
-            -maxdepth 1 -type l -name '*.ninfer' | sort)
+        mapfile -t found < <(find "$snap" -maxdepth 1 \( -type f -o -type l \) \
+            -name '*.ninfer' 2>/dev/null | sort)
         case "${#found[@]}" in
-            0) fail "no .ninfer artifact in $snapshot (still downloading, or not an NInfer repo?)" ;;
-            1) artifact="${found[0]}" ;;
-            *) fail "multiple .ninfer artifacts in $snapshot; set NINFER_ARTIFACT to choose one" ;;
+            0) return 1 ;;
+            1) artifact="${found[0]}"; return 0 ;;
+            *) fail "multiple .ninfer artifacts in $snap; set NINFER_ARTIFACT to choose one" ;;
         esac
+    }
+
+    if ! resolve_artifact; then
+        log "cache directory present but no artifact yet; waiting up to ${cache_wait}s"
+        waited=0
+        while ! resolve_artifact && (( waited < cache_wait )); do
+            sleep 5
+            waited=$(( waited + 5 ))
+            (( waited % 60 == 0 )) && log "  still waiting for the artifact (${waited}s)"
+        done
     fi
+    [[ -n "$artifact" ]] || fail \
+        "no .ninfer artifact under $model_root after ${cache_wait}s; the download may be incomplete"
 fi
 
 # The cache stores blobs out of tree and links them into the snapshot.
@@ -151,15 +238,11 @@ fi
 
 # --- 3. Run the engine ------------------------------------------------------
 
-# The load balancer routes traffic to PORT and polls HEALTH_CHECK_PATH on
-# PORT_HEALTH. ninfer-serve answers /health on its single listener, so set
-# HEALTH_CHECK_PATH=/health on the endpoint and leave PORT_HEALTH equal to PORT.
-port="${PORT:-80}"
-
+# Ports were resolved in section 0, before the gate was started. ninfer-serve
+# defaults to 8080, so --port is always passed explicitly below.
 args=(
     ninfer-serve "$artifact"
     --host 0.0.0.0
-    --port "$port"
     --max-context "$max_context"
     --kv-capacity "${NINFER_KV_CAPACITY:-auto}"
     --kv-dtype "$kv_dtype"
@@ -197,6 +280,43 @@ fi
 # Word splitting is intended here: NINFER_EXTRA_ARGS carries additional flags.
 # shellcheck disable=SC2206
 [[ -n "${NINFER_EXTRA_ARGS:-}" ]] && args+=(${NINFER_EXTRA_ARGS})
+
+args+=(--port "$engine_port")
+
+if [[ "$health_port" == "$port" ]]; then
+    # The gate from section 0 already holds this port and is answering 204. Start
+    # the engine on its internal port; the gate releases the port as soon as the
+    # engine's own /health returns 200.
+    log "exec: ${args[*]}"
+    "${args[@]}" &
+    engine_pid=$!
+
+    # If the engine dies during load, stop rather than proxying to nothing.
+    wait "$gate_pid" 2>/dev/null || true
+    if ! kill -0 "$engine_pid" 2>/dev/null; then
+        wait "$engine_pid" 2>/dev/null
+        fail "ninfer-serve exited during startup; see the engine output above"
+    fi
+    trap - EXIT
+    log "engine is ready; forwarding :${port} to :${engine_port}"
+    exec perl -e '
+        use IO::Socket::INET; use POSIX ":sys_wait_h";
+        my ($lp, $ep) = @ARGV;
+        $SIG{CHLD} = sub { 1 while waitpid(-1, WNOHANG) > 0 };
+        my $srv = IO::Socket::INET->new(LocalAddr => "0.0.0.0", LocalPort => $lp,
+            Listen => 512, Proto => "tcp", ReuseAddr => 1) or die "bind $lp: $!\n";
+        while (my $c = $srv->accept) {
+            my $pid = fork; next if $pid;
+            my $u = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $ep,
+                                          Proto => "tcp") or exit 1;
+            # Relay both directions until either side closes.
+            my $r = fork;
+            if ($r) { while (sysread($c, my $b, 65536)) { syswrite($u, $b) } }
+            else    { while (sysread($u, my $b, 65536)) { syswrite($c, $b) } exit 0 }
+            close $c; close $u; exit 0;
+        }
+    ' "$port" "$engine_port"
+fi
 
 log "exec: ${args[*]}"
 exec "${args[@]}"
