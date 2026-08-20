@@ -99,7 +99,8 @@ port 80, and carries the environment an endpoint needs; the only difference is
 
 Both set `containerDiskInGb: 30` and `volumeInGb: 0`. No volume is needed because
 the cached model arrives on `/runpod-volume` independently, and the container disk
-only holds the 4.4 GiB image plus logs.
+only holds the 4.4 GiB image plus logs. Both also carry a generated `NINFER_API_KEY`;
+see [Authentication](#authentication).
 
 Recreate or update them with `saveTemplate`, whose required fields are `name`,
 `imageName`, `containerDiskInGb`, `volumeInGb`, `dockerArgs`, and `env`. Passing an
@@ -247,7 +248,8 @@ slowly than `standard`, independent of the artifact.
 | `NINFER_DRAFT_TOKENS` | `3` | Speculative draft window |
 | `NINFER_LM_HEAD_DRAFT` | `1` | Load the optimized proposal head |
 | `NINFER_PRESERVE_THINKING` | `1` | Retain closed-turn reasoning |
-| `NINFER_API_KEY` | unset | Require a bearer token on requests |
+| `NINFER_API_KEY` | **required** | Key clients must send as `x-api-key` |
+| `NINFER_ALLOW_ANONYMOUS` | `0` | Set `1` to serve without auth (public URL) |
 | `NINFER_PENDING_TIMEOUT_MS` | `120000` | Admission wait before a request is rejected |
 | `NINFER_VISION` | `0` | Set `1` to enable image and video input |
 | `NINFER_CORS` | `0` | Set `1` to send CORS headers |
@@ -259,6 +261,28 @@ slowly than `standard`, independent of the artifact.
 DFlash accepts concurrency only in `1..8`; the `highconc` profile sits exactly at
 that boundary and MTP has no such limit.
 
+## Authentication
+
+A load balancing endpoint answers on a public URL, and every request it serves bills
+GPU time, so the engine must require its own key. `NINFER_API_KEY` supplies it and
+the entrypoint refuses to start without one; set `NINFER_ALLOW_ANONYMOUS=1` to serve
+openly on purpose.
+
+**Send the engine's key as `x-api-key`, not as a bearer token.** Runpod's proxy uses
+the `Authorization` header for account-level auth, so a bearer token intended for the
+engine can be consumed before it arrives. `ninfer-serve` accepts either header, and
+`x-api-key` is the one that passes through cleanly. Both templates already carry a
+generated key; read it back with:
+
+```bash
+curl -s -H "Authorization: Bearer $RUNPOD_API_KEY" \
+  https://rest.runpod.io/v1/templates |
+  python3 -c 'import json,sys; [print(t["name"], {e["key"]:e["value"] for e in t["env"]}.get("NINFER_API_KEY")) for t in json.load(sys.stdin)]'
+```
+
+`/health` stays unauthenticated regardless, so the load balancer can keep polling it.
+That route reveals nothing but liveness.
+
 ## Calling the endpoint
 
 The engine's own routes are served directly, so any OpenAI-compatible client works
@@ -267,9 +291,11 @@ by pointing its base URL at the endpoint:
 ```bash
 curl https://<ENDPOINT_ID>.api.runpod.ai/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "x-api-key: $NINFER_API_KEY" \
   -d '{"model":"ninfer","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 `/v1/models`, `/v1/responses`, and `/v1/messages` are available on the same host.
-Set `NINFER_API_KEY` to require a bearer token; `/health` stays unauthenticated so
-the load balancer can keep polling it.
+
+For a client that only speaks bearer auth, Anthropic-style tooling maps cleanly:
+`ANTHROPIC_API_KEY` becomes `x-api-key`, which is exactly the header to use here.

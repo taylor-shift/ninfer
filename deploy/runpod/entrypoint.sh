@@ -174,9 +174,25 @@ if [[ "$spec" == "mtp" || "$spec" == "dflash" ]]; then
 fi
 
 [[ "${NINFER_PRESERVE_THINKING:-1}" == "1" ]] && args+=(--preserve-thinking)
-[[ -n "${NINFER_API_KEY:-}" ]] && args+=(--api-key "$NINFER_API_KEY")
 [[ "${NINFER_VISION:-0}" == "1" ]] && args+=(--vision)
 [[ "${NINFER_CORS:-0}" == "1" ]] && args+=(--cors)
+
+# A load balancing endpoint is reachable at a public URL, so the engine is given
+# its own key rather than relying on the platform in front of it. Refuse to start
+# without one: an unauthenticated engine here is open to anyone with the URL, and
+# it bills GPU time while serving them.
+#
+# Present the key as x-api-key, not Authorization. Runpod's proxy uses the
+# Authorization header for account-level auth, so a bearer token aimed at the
+# engine can be consumed before it arrives; ninfer-serve accepts either form.
+if [[ -n "${NINFER_API_KEY:-}" ]]; then
+    args+=(--api-key "$NINFER_API_KEY")
+elif [[ "${NINFER_ALLOW_ANONYMOUS:-0}" == "1" ]]; then
+    log "WARNING: NINFER_ALLOW_ANONYMOUS=1 — serving without an API key"
+else
+    fail "NINFER_API_KEY is not set. Set it on the endpoint so requests must carry
+       x-api-key, or set NINFER_ALLOW_ANONYMOUS=1 to deliberately serve without auth."
+fi
 
 # Word splitting is intended here: NINFER_EXTRA_ARGS carries additional flags.
 # shellcheck disable=SC2206
