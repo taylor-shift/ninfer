@@ -28,7 +28,13 @@
 
 model_list:
   # ---- text pool ------------------------------------------------------
+  # Per-deployment max_parallel_requests caps the proxy's own view at engine
+  # capacity (engines x C=2) so a saturated deployment stops attracting
+  # traffic — least-busy cannot see INSIDE an engine's admission queue
+  # (requests waiting for a C=2 slot 503 after --pending-timeout-ms, default
+  # 30s), so the cap is the only proxy-side guard against queue pile-up.
   - model_name: qwen3.8-27b
+    max_parallel_requests: 12    # vast: 6 text engines x C=2
     litellm_params:
       model: openai/qwen3.8-27b
       api_base: ${NINFER_POOL_VAST_BASE}
@@ -36,6 +42,7 @@ model_list:
     litellm_model_name: vast-8x5090
 
   - model_name: qwen3.8-27b
+    max_parallel_requests: 10    # runpod: 5 text engines x C=2
     litellm_params:
       model: openai/qwen3.8-27b
       api_base: https://ee29h260cf8cwh-8000.proxy.runpod.net/v1
@@ -43,6 +50,8 @@ model_list:
     litellm_model_name: runpod-7x5090
 
   - model_name: qwen3.8-27b
+    max_parallel_requests: 2     # local: 1 engine x C=2 (shares the card with
+                                 # interactive local work — keep the cap tight)
     litellm_params:
       model: openai/qwen3.8-27b
       api_base: http://192.168.8.15:8000/v1
@@ -51,6 +60,7 @@ model_list:
 
   # ---- vision pool ----------------------------------------------------
   - model_name: qwen3.8-27b-vision
+    max_parallel_requests: 4     # runpod: 2 vision engines x C=2
     litellm_params:
       model: openai/qwen3.8-27b
       api_base: https://ee29h260cf8cwh-8001.proxy.runpod.net/v1
@@ -77,14 +87,28 @@ router_settings:
                                    # non-retryable client error, so the ONLY
                                    # failover path is fast exclusion here.
                                    # 30s cooldown = back in rotation fast on recovery.
-  request_timeout: 900             # long-context generations run for minutes
-  # num_workers: MUST stay 1 (default). Uvicorn workers are separate processes
-  # with SEPARATE in-memory router state: >1 workers breaks least-busy
-  # (per-worker in-flight blind spots) and multiplies the fails needed for
-  # cooldown by the worker count. The server is async — one process handles
-  # all concurrent streams.
-  num_workers: 1
-  max_parallel_requests: 64
+  # NOTE: uvicorn runs a single worker process (launch: no `--workers`).
+  # Do NOT add num_workers: >1: workers are separate processes with separate
+  # in-memory router state, which fragments least-busy and multiplies the
+  # fails needed for cooldown by the worker count. The server is async — one
+  # process handles all concurrent streams. (The proxy logs cosmetic
+  # "not a valid argument for Router.__init__" warnings for proxy-level keys
+  # like num_workers/max_parallel_requests — harmless, the proxy reads them.)
+  max_parallel_requests: 64        # global concurrency cap at the proxy
+
+# NOTE on request_timeout: do NOT set it. The global default is 6000 s
+# (litellm.request_timeout); a smaller explicit value (e.g. 900 s) risks
+# cutting a 262k-context generation mid-stream, and it is silently ignored
+# under router_settings (valid only as a litellm global / REQUEST_TIMEOUT env).
+
+# NOTE on thinking controls: ninfer accepts per-request `reasoning_effort`
+# (none|minimal|low|medium|high|xhigh|max) and `preserve_thinking` (bool).
+# LiteLLM rejects unknown OpenAI params, so clients that use them must send
+# allowed_openai_params in the SAME request body:
+#   {"reasoning_effort": "none", "allowed_openai_params": ["reasoning_effort"], ...}
+# Verified end-to-end through this proxy: 468 ms wall, 0 thinking tokens
+# (vs seconds+ with default max effort). drop_params must stay OFF — it would
+# silently drop the param instead of passing it through.
 
 general_settings:
   master_key: os.environ/NINFER_POOL_API_KEY   # clients must send this key
