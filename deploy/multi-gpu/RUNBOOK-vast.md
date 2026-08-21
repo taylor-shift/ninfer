@@ -33,18 +33,14 @@ engine's smaller context does not reduce usable image capacity.
 
 ## Current deployment
 
-- Instance **48240339**, Vast, Brazil, 8×RTX 5090, machine 141452, 80 GB disk,
-  artifact at `/workspace/qwen3_8_27b_nvfp4.ninfer` (persists across stop/start)
-- **Template-linked (2026-08-21)**: instance spec now follows template
-  **582886** (`ninfer-8x5090-vision`, v6 image, ports 8000/8001, full env).
-  `vastai start instance 48240339` is the one-command restart (~2–3 min to
-  healthy: artifact is on disk).
-- **State 2026-08-21: STOPPED** ($0/hr) after the console-recreate incident —
-  both the 48240339 and 48257073 instances were stopped; see *Console button
-  gotcha* below. 48257073 is a disposable duplicate (ephemeral disk) — destroy
-  it at will.
-- Driver **595.71.05 = CUDA 13.2** (ninfer needs ≥13.1)
-- SSH: `vastai show instance 48240339 --raw` → `ports['22/tcp']`
+- Instance **48261525**, Vast, 8×RTX 5090 (host CUDA 13.2), **50 GB disk**,
+  created 2026-08-21 from template **584160** (`ninfer-8x5090`)
+- Ports (fixed for the instance's life): `8000/tcp → 50557`, `8001/tcp →
+  50531`, `22/tcp → 50504` (re-read via `show instance --raw` when in doubt)
+- Restart: `vastai start instance 48261525` (~8 min cold: 20.5 GB artifact
+  pull at ~90 MB/s + 8 engine loads; warm start after stop is ~2–3 min)
+- State file `vast-instance-id` (next to this runbook) tracks the live id for
+  `fleet.sh` / `refresh-dsh-endpoint.sh`.
 
 ### Port stability (verified 2026-08-20)
 
@@ -182,8 +178,20 @@ curl -s -o /dev/null -w "vision:%{http_code}\n" 127.0.0.1:8001/health
    serializes streams: N-way per-stream tps is meaningless (wall times survive).
    `scp llm_bench.py` to the box and run it there.
 7. Vast **instance disk survives stop/start** (unlike RunPod's container disk);
-   only *destroy* wipes it. No 8×5090 CUDA≥13.1 host currently offers Vast
-   volumes (checked all 64 volume-offering machines — zero overlap).
+    only *destroy* wipes it. On docker-loop hosts the 50 GB is the container
+    overlay itself (no separate volume mount): `/` is 50 G, and `NINFER_
+    VOLUME_PATH=/workspace` is a plain dir on it.
+ 8. **A missing `/workspace` kills the boot silently (seen 2026-08-21,
+    instance 48261525, billed for a stuck box).** The entrypoint assumed
+    `NINFER_VOLUME_PATH` exists (RunPod mounts it; Vast does not create it).
+    The fetcher then died with `set -e` before logging anything, and the
+    entrypoint hung in `do_wait` on the dead child — container "healthy",
+    `vastai logs` frozen after `artifact absent; downloading …`, no file, no
+    process. Fix: the entrypoint now `mkdir -p`s the path (commit 1694d4f1)
+    and the template onstart runs `mkdir -p /workspace &&` first. If you meet
+    the hang: `mkdir -p /workspace`, re-run `ninfer-fetch-artifact` by hand,
+    then kill the stuck `bash /.launch` (NOT PID 1) so the container re-boots
+    into the staged artifact.
 
 ## Recreate from templates (fast path)
 
@@ -203,21 +211,27 @@ authenticated artifact pulls, sha256-verified artifact):
   # first cold start pulls the artifact (HF_TOKEN baked in); the volume cache
   # then survives stop/start
   ```
-- **Vast `582886`** (`ninfer-8x5090-vision` — the CANONICAL Vast template;
-  this is what the console's "recreate with last template" button would use,
-  so it carries the full known-good spec: v6 image, `-p 8000:8000
-  -p 8001:8001`, env incl. `NINFER_MAX_CONCURRENCY=2`, `NINFER_TEXT_CONTEXT=
-  262144`, `NINFER_VISION=1`, `NINFER_VISION_CONTEXT=196608`, artifact SHA,
-  **HF_TOKEN** for authenticated pulls):
+- **Vast `584160`** (`ninfer-8x5090` — the CANONICAL Vast template, created
+  2026-08-21; visible in the GUI as a private template). Full known-good spec
+  baked in: v6 image, `-p 8000:8000 -p 8001:8001`, env incl.
+  `NINFER_MAX_CONCURRENCY=2`, `NINFER_TEXT_CONTEXT=262144`,
+  `NINFER_VISION=1`, `NINFER_VISION_CONTEXT=196608`, artifact SHA,
+  **HF_TOKEN** for authenticated pulls — **plus the offer filter**
+  (`num_gpus>=8, gpu_name=RTX_5090, cuda_max_good>=13.1, rentable, verified`)
+  so the GUI only lists suitable hosts:
   ```bash
-  vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true' -o dph
-  vastai create instance <OFFER_ID> --template_hash f6d7c56136ee099b2bd381a455a20de6
+  vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true verified=true' -o dph
+  vastai create instance <OFFER_ID> --template_hash 91db200ac7774133b100da2078bf7265 --disk 50
   vastai attach ssh <NEW_ID> "$(cat ~/.ssh/id_ed25519.pub)"
   /code/llm-cluster/ninfer-multi/refresh-dsh-endpoint.sh <NEW_ID>   # ports rotate on recreate
   ```
-  (A second, older template `583526` was deleted 2026-08-21 to keep exactly
-  one source of truth. `vastai update template <hash> --env '<docker options>'`
-  updates the spec in place; the hash changes after an update.)
+  **Disk gotcha:** the template's `disk_space` (50) is a RECOMMENDATION shown
+  in the GUI; the CLI defaults to 10 GB unless you pass `--disk 50`. The
+  20.5 GB artifact needs ≥50 GB. In the GUI the recommended 50 GB is
+  pre-filled — keep it.
+  (Older templates `583526` and `582886` are superseded/deleted; keep exactly
+  one. `vastai update template <hash> ...` updates in place; the hash changes
+  after every update.)
 
 Note: the template stores `NINFER_API_KEY` and `HF_TOKEN` in its env;
 treat it as secret-bearing (visible to the account).
@@ -229,7 +243,7 @@ rebuilding.
 
 ```bash
 vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true' -o dph
-vastai create instance <OFFER_ID> --image lroel/ninfer-pod-multi:v6 --disk 80 --ssh --direct \
+vastai create instance <OFFER_ID> --image lroel/ninfer-pod-multi:v6 --disk 50 --ssh --direct \
   --env '-p 8000:8000 -p 8001:8001 -e NINFER_API_KEY=<key> -e NINFER_MODEL=neroued/Qwen3.8-27B-nvfp4-NInfer -e NINFER_ARTIFACT=qwen3_8_27b_nvfp4.ninfer -e NINFER_VOLUME_PATH=/workspace -e NINFER_ARTIFACT_SHA256=bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32 -e HF_TOKEN=<hf> -e NINFER_KV_DTYPE=int8 -e NINFER_KV_CAPACITY=auto -e NINFER_MAX_CONCURRENCY=2 -e NINFER_SPEC=mtp -e NINFER_DRAFT_TOKENS=3 -e NINFER_LM_HEAD_DRAFT=1 -e NINFER_TEXT_CONTEXT=262144 -e NINFER_VISION=1 -e NINFER_VISION_CONTEXT=196608 -e NINFER_ALLOW_ARIA2=0 -e NINFER_DOWNLOAD_CONNECTIONS=16 -e NINFER_PROFILE=auto -e NINFER_START_STAGGER_S=5 -e NINFER_PENDING_TIMEOUT_MS=120000 -e NINFER_PRESERVE_THINKING=1 -e NINFER_ENABLE_SSHD=1 -e PORT=8000' \
   --onstart-cmd '/usr/local/bin/ninfer-multi-entrypoint'
 vastai attach ssh <INSTANCE_ID> "$(cat ~/.ssh/id_ed25519.pub)"

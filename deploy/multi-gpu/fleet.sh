@@ -399,6 +399,101 @@ cmd_pool() {
   esac
 }
 
+# --------------------------------------------------------------- vast new ---
+# One-command Vast recreate: search offer -> create from the canonical
+# template (private template 584160 "ninfer-8x5090" — the same one shown in
+# the Vast GUI: image v6, split-fleet env, ports 8000/8001, onstart entrypoint
+# with mkdir guard, HF_TOKEN, offer filter 8x5090 CUDA>=13.1) -> attach SSH
+# -> state file -> wait for /health -> repoint DSH + pool proxy.
+#
+# Vast platform quirks this encodes (learned 2026-08-21, both cost money):
+#   * --disk is a CREATE-TIME flag; the template's --disk_space does NOT size
+#     the container disk (defaulted to 10 GB = guaranteed artifact-pull
+#     failure). Default here: 50 GB (20.5 GB artifact + headroom).
+#   * `update template` has REPLACE semantics — a partial update (e.g. only
+#     --disk_space) WIPES the other fields (image/env/onstart), after which
+#     every create fails "400: Invalid args". Always re-issue the FULL spec.
+#     See RUNBOOK-vast.md for the full re-issue command.
+#   * The console's "recreate container with last template" button creates a
+#     NEW instance (double billing) — never use it on a running fleet.
+
+VAST_TEMPLATE_HASH="${VAST_TEMPLATE_HASH:-dd2a1614c1bf092ffb5f84ca330458ed}"
+VAST_DISK_GB="${VAST_DISK_GB:-50}"
+VAST_OFFER_FILTER="${VAST_OFFER_FILTER:-num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true verified=true}"
+VAST_NEW_WAIT="${VAST_NEW_WAIT:-900}"
+
+cmd_vast_new() {
+  local existing offers offer out id ip p8000 p8001 waited code
+  # 1. Refuse while a Vast instance is running/starting (no double billing).
+  existing="$(vastai show instances --raw 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+insts = d if isinstance(d, list) else d.get("instances") or []
+print(",".join(str(i.get("id")) for i in insts
+               if (i.get("cur_state") or "").lower() in ("running", "starting")))
+' 2>/dev/null || true)"
+  if [[ -n "$existing" ]]; then
+    echo "Vast instance(s) already up: $existing — stop/destroy first (no double billing)" >&2
+    return 1
+  fi
+  # 2. Offers, cheapest first; try each until one takes.
+  offers="$(vastai search offers "$VAST_OFFER_FILTER" -o dph 2>/dev/null |
+            sed 's/\x1b\[[0-9;]*m//g' | awk 'NR>1 {print $2}')"
+  if [[ -z "$offers" ]]; then
+    echo "no matching offers ($VAST_OFFER_FILTER)" >&2
+    return 1
+  fi
+  id=""
+  while read -r offer; do
+    [[ -n "$offer" ]] || continue
+    out="$(vastai create instance "$offer" --template_hash "$VAST_TEMPLATE_HASH" \
+             --disk "$VAST_DISK_GB" 2>&1 || true)"
+    if echo "$out" | grep -q 'success.*True'; then
+      id="$(echo "$out" | grep -oP '"new_contract":\s*\K[0-9]+' | head -1)"
+      echo "created instance $id from offer $offer (${VAST_DISK_GB} GB disk)"
+      break
+    else
+      echo "offer $offer rejected: $(echo "$out" | head -c 90)"
+    fi
+  done <<< "$offers"
+  if [[ -z "$id" ]]; then
+    echo "all offers rejected — template broken? (update template is REPLACE: re-issue the FULL spec, see RUNBOOK-vast.md)" >&2
+    return 1
+  fi
+  vastai attach ssh "$id" "$(cat ~/.ssh/id_ed25519.pub)" >/dev/null 2>&1 || true
+  echo "$id" > "$VAST_STATE_FILE"
+  VAST_INSTANCE="$id"
+  # 3. Wait for host ports + /health (artifact pull ~4 min with HF_TOKEN;
+  #    8 engines ~2-3 min more). Ports are allocated a minute or two after start.
+  waited=0
+  VAST_URL=""; VAST_VISION_URL=""
+  while (( waited < VAST_NEW_WAIT )); do
+    read -r ip p8000 p8001 < <(vast_mapping) || true
+    if [[ -n "$ip" && "$ip" != "-" && -n "$p8000" ]]; then
+      code="$(health_code "http://${ip}:${p8000}/health")"
+      if [[ "$code" == "200" ]]; then break; fi
+    fi
+    waited=$((waited + 20))
+    echo "  waiting for $id (ip=${ip:-...} :8000=${p8000:-...}) ${waited}/${VAST_NEW_WAIT}s"
+    sleep 20
+  done
+  read -r ip p8000 p8001 < <(vast_mapping) || true
+  if [[ -z "${ip:-}" || "$ip" == "-" || -z "${p8000:-}" ]]; then
+    echo "timed out waiting for $id — diagnose: vastai logs $id" >&2
+    return 1
+  fi
+  VAST_URL="http://${ip}:${p8000}/v1"
+  [[ -n "$p8001" ]] && VAST_VISION_URL="http://${ip}:${p8001}/v1"
+  # 4. Repoint: DSH route + endpoints file + pool proxy (fresh base).
+  rewrite_baseurl ninfer-8x5090 "$VAST_URL"
+  write_endpoints
+  cmd_pool stop >/dev/null 2>&1 || true
+  sleep 1
+  cmd_pool start
+  echo "VAST FRESH: instance $id ip=$ip text=$VAST_URL vision=${VAST_VISION_URL:-none}"
+  echo "verify: fleet.sh status"
+}
+
 # ------------------------------------------------------------------- main ---
 
 cmd="${1:-status}"
@@ -408,5 +503,7 @@ case "$cmd" in
   down)     shift; cmd_down "${1:-both}" ;;
   register) shift; cmd_register "$@" ;;
   pool)     shift; cmd_pool "${1:-status}" ;;
-  *) echo "usage: fleet.sh {status|up|down|register|pool} [vast|runpod]" >&2; exit 2 ;;
+  vast)     [[ "${2:-}" == "new" ]] && { cmd_vast_new; exit; }
+            echo "usage: fleet.sh vast new" >&2; exit 2 ;;
+  *) echo "usage: fleet.sh {status|up|down|register|pool|vast new} [vast|runpod]" >&2; exit 2 ;;
 esac
