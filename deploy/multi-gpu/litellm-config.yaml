@@ -67,10 +67,10 @@ model_list:
       api_key: os.environ/NINFER_RUNPOD_API_KEY
     litellm_model_name: runpod-7x5090-vision
 
-  # Vast vision: enabled at startup when NINFER_POOL_VAST_VISION_BASE is set
-  # (the running Vast instance publishes :8001 since the 2026-08-21 recreate,
-  # template 583526). Kept as a comment because LiteLLM hard-fails on a
-  # deployment whose env ref is empty.
+  # Vast vision: enabled at startup when NINFER_POOL_VAST_VISION_BASE is set.
+  # The canonical Vast template (582886, fixed 2026-08-21) publishes
+  # :8001, so the next start of instance 48240339 exposes it. Kept as a
+  # comment because LiteLLM hard-fails on a deployment whose env ref is empty.
   # - model_name: qwen3.8-27b-vision
   #   litellm_params:
   #     model: openai/qwen3.8-27b

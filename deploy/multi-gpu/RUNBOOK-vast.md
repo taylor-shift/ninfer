@@ -33,9 +33,17 @@ engine's smaller context does not reduce usable image capacity.
 
 ## Current deployment
 
-- Instance **48240339**, Vast, Brazil, 8×RTX 5090, **$3.73/hr**, machine 141452
+- Instance **48240339**, Vast, Brazil, 8×RTX 5090, machine 141452, 80 GB disk,
+  artifact at `/workspace/qwen3_8_27b_nvfp4.ninfer` (persists across stop/start)
+- **Template-linked (2026-08-21)**: instance spec now follows template
+  **582886** (`ninfer-8x5090-vision`, v6 image, ports 8000/8001, full env).
+  `vastai start instance 48240339` is the one-command restart (~2–3 min to
+  healthy: artifact is on disk).
+- **State 2026-08-21: STOPPED** ($0/hr) after the console-recreate incident —
+  both the 48240339 and 48257073 instances were stopped; see *Console button
+  gotcha* below. 48257073 is a disposable duplicate (ephemeral disk) — destroy
+  it at will.
 - Driver **595.71.05 = CUDA 13.2** (ninfer needs ≥13.1)
-- Image `lroel/ninfer-pod-multi:v4`, disk 80 GB, artifact at `/workspace/qwen3_8_27b_nvfp4.ninfer`
 - SSH: `vastai show instance 48240339 --raw` → `ports['22/tcp']`
 
 ### Port stability (verified 2026-08-20)
@@ -54,6 +62,29 @@ After a rebuild, repoint DSH with:
 
 It reads the live mapping, health-checks it, and rewrites only the
 `ninfer-8x5090` provider's `baseURL` in `~/.dsh/settings.yaml`.
+
+### Console button gotcha (2026-08-21, cost: 2 instances running ~1 h)
+
+The Vast console's **"recreate container with last template used"** button does
+NOT recreate the container of the instance you clicked — it **creates a new
+instance** from the account's *last-used template*, and also re-boots the old
+container with re-mapped host ports. If the instance has no template
+(`template_id: None`, e.g. created via CLI), its own spec is not used at all.
+
+Rules:
+
+1. **Never use that button on a running fleet.** It double-bills.
+2. The *last-used template* is whatever the account last created an instance
+   from — keep the canonical template (582886) current or a future click
+   re-injects a stale env (the incident env was `NINFER_MAX_CONCURRENCY=4` with
+   no `NINFER_TEXT_CONTEXT`/`NINFER_VISION_CONTEXT`, which crashed 7/8 engines
+   at warmup with `cudaErrorInvalidValue` in `gqa_attention_prefill`).
+3. Billing levers: **stop** = $0/hr, instance + spec + **disk survive**
+   (artifact included); **destroy** = gone (disk wiped). Stop while deciding.
+4. Env/image/onstart on a *running* instance can be fixed without a new
+   instance: `vastai update instance <ID> --env '<json dict>'`
+   (JSON, not KEY=VAL pairs; API may also require `--image`), then
+   `vastai stop` + `vastai start` to apply.
 
 ### DSH provider
 
@@ -172,17 +203,24 @@ authenticated artifact pulls, sha256-verified artifact):
   # first cold start pulls the artifact (HF_TOKEN baked in); the volume cache
   # then survives stop/start
   ```
-- **Vast `583526`** (`ninfer-8x5090`, 80 GB disk, onstart entrypoint,
-  baked offer filters: 8+× RTX_5090, CUDA ≥13.1, verified, rentable):
+- **Vast `582886`** (`ninfer-8x5090-vision` — the CANONICAL Vast template;
+  this is what the console's "recreate with last template" button would use,
+  so it carries the full known-good spec: v6 image, `-p 8000:8000
+  -p 8001:8001`, env incl. `NINFER_MAX_CONCURRENCY=2`, `NINFER_TEXT_CONTEXT=
+  262144`, `NINFER_VISION=1`, `NINFER_VISION_CONTEXT=196608`, artifact SHA,
+  **HF_TOKEN** for authenticated pulls):
   ```bash
   vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true' -o dph
-  vastai create instance <OFFER_ID> --template_hash 05f0622c335b14dfcda852dfbf228b7c
+  vastai create instance <OFFER_ID> --template_hash f6d7c56136ee099b2bd381a455a20de6
   vastai attach ssh <NEW_ID> "$(cat ~/.ssh/id_ed25519.pub)"
   /code/llm-cluster/ninfer-multi/refresh-dsh-endpoint.sh <NEW_ID>   # ports rotate on recreate
   ```
+  (A second, older template `583526` was deleted 2026-08-21 to keep exactly
+  one source of truth. `vastai update template <hash> --env '<docker options>'`
+  updates the spec in place; the hash changes after an update.)
 
-Note: both templates store `NINFER_API_KEY` and `HF_TOKEN` in their env;
-treat the templates as secret-bearing (template-visible to the account).
+Note: the template stores `NINFER_API_KEY` and `HF_TOKEN` in its env;
+treat it as secret-bearing (visible to the account).
 
 The manual command below is the reference/fallback if a template ever needs
 rebuilding.
@@ -191,11 +229,17 @@ rebuilding.
 
 ```bash
 vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true' -o dph
-vastai create instance <OFFER_ID> --image lroel/ninfer-pod-multi:v4 --disk 80 --ssh --direct \
-  --env '-p 8000:8000 -p 8001:8001 -e NINFER_API_KEY=<key> -e NINFER_MODEL=neroued/Qwen3.8-27B-nvfp4-NInfer -e NINFER_ARTIFACT=qwen3_8_27b_nvfp4.ninfer -e NINFER_VOLUME_PATH=/workspace -e NINFER_ARTIFACT_SHA256=bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32' \
+vastai create instance <OFFER_ID> --image lroel/ninfer-pod-multi:v6 --disk 80 --ssh --direct \
+  --env '-p 8000:8000 -p 8001:8001 -e NINFER_API_KEY=<key> -e NINFER_MODEL=neroued/Qwen3.8-27B-nvfp4-NInfer -e NINFER_ARTIFACT=qwen3_8_27b_nvfp4.ninfer -e NINFER_VOLUME_PATH=/workspace -e NINFER_ARTIFACT_SHA256=bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32 -e HF_TOKEN=<hf> -e NINFER_KV_DTYPE=int8 -e NINFER_KV_CAPACITY=auto -e NINFER_MAX_CONCURRENCY=2 -e NINFER_SPEC=mtp -e NINFER_DRAFT_TOKENS=3 -e NINFER_LM_HEAD_DRAFT=1 -e NINFER_TEXT_CONTEXT=262144 -e NINFER_VISION=1 -e NINFER_VISION_CONTEXT=196608 -e NINFER_ALLOW_ARIA2=0 -e NINFER_DOWNLOAD_CONNECTIONS=16 -e NINFER_PROFILE=auto -e NINFER_START_STAGGER_S=5 -e NINFER_PENDING_TIMEOUT_MS=120000 -e NINFER_PRESERVE_THINKING=1 -e NINFER_ENABLE_SSHD=1 -e PORT=8000' \
   --onstart-cmd '/usr/local/bin/ninfer-multi-entrypoint'
 vastai attach ssh <INSTANCE_ID> "$(cat ~/.ssh/id_ed25519.pub)"
 ```
+
+**Env is load-bearing.** Missing `NINFER_TEXT_CONTEXT`/`NINFER_VISION_CONTEXT`
+makes the entrypoint auto-size context from free KV, and a stale
+`NINFER_MAX_CONCURRENCY=4` + auto-ctx combo crashed 7/8 engines at warmup
+(`cudaErrorInvalidValue`, `gqa_attention_prefill.cu:58`) on 2026-08-21. The
+known-good values above are the split-fleet spec (see table at top).
 
 Artifact download is sha256-verified (`bb3360522a06e136…`); it lands in ~4 min at
 ~91 MB/s on a well-connected host. **Never trust size alone** — a partial
