@@ -67,16 +67,17 @@ model_list:
       api_key: os.environ/NINFER_RUNPOD_API_KEY
     litellm_model_name: runpod-7x5090-vision
 
-  # Vast vision: enabled at startup when NINFER_POOL_VAST_VISION_BASE is set.
-  # The canonical Vast template (582886, fixed 2026-08-21) publishes
-  # :8001, so the next start of instance 48240339 exposes it. Kept as a
-  # comment because LiteLLM hard-fails on a deployment whose env ref is empty.
-  # - model_name: qwen3.8-27b-vision
-  #   litellm_params:
-  #     model: openai/qwen3.8-27b
-  #     api_base: ${NINFER_POOL_VAST_VISION_BASE}
-  #     api_key: os.environ/NINFER_VAST_API_KEY
-  #   litellm_model_name: vast-8x5090-vision
+  # Vast vision: the canonical template (584160) publishes :8001. fleet.sh
+  # injects the base from the live mapping (persisting the last-known value in
+  # vast-vision-base) so an empty var can never hard-fail pool startup; a dead
+  # (recreated) base is dropped by the router after one failure.
+  - model_name: qwen3.8-27b-vision
+    max_parallel_requests: 4     # vast: 2 vision engines x C=2
+    litellm_params:
+      model: openai/qwen3.8-27b
+      api_base: ${NINFER_POOL_VAST_VISION_BASE}
+      api_key: os.environ/NINFER_VAST_API_KEY
+    litellm_model_name: vast-8x5090-vision
 
 router_settings:
   routing_strategy: least-busy     # in-flight per deployment, like balancer.pl

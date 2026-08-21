@@ -82,6 +82,16 @@ VAST_URL=""
 [[ "$VAST_IP" != "-" && -n "$VAST_P8000" ]] && VAST_URL="http://${VAST_IP}:${VAST_P8000}/v1"
 VAST_VISION_URL=""
 [[ "$VAST_IP" != "-" && -n "$VAST_P8001" ]] && VAST_VISION_URL="http://${VAST_IP}:${VAST_P8001}/v1"
+# Last known vision base persists across (re)creates so the pool can start
+# with a (possibly stale) Vast vision deployment instead of hard-failing on an
+# empty ${NINFER_POOL_VAST_VISION_BASE}; the router drops a dead deployment
+# after one failure (cooldown 30s).
+VISION_BASE_FILE="$SCRIPT_DIR/vast-vision-base"
+if [[ -n "$VAST_VISION_URL" ]]; then
+  echo "$VAST_VISION_URL" > "$VISION_BASE_FILE"
+elif [[ -f "$VISION_BASE_FILE" ]]; then
+  VAST_VISION_URL="$(cat "$VISION_BASE_FILE")"
+fi
 
 # RunPod endpoint: proxy URL is constant for the life of the pod.
 RP_URL="${RUNPOD_PROXY}-8000.proxy.runpod.net/v1"

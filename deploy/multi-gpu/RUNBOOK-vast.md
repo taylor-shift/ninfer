@@ -37,10 +37,18 @@ engine's smaller context does not reduce usable image capacity.
   created 2026-08-21 from template **584160** (`ninfer-8x5090`)
 - Ports (fixed for the instance's life): `8000/tcp → 50557`, `8001/tcp →
   50531`, `22/tcp → 50504` (re-read via `show instance --raw` when in doubt)
-- Restart: `vastai start instance 48261525` (~8 min cold: 20.5 GB artifact
-  pull at ~90 MB/s + 8 engine loads; warm start after stop is ~2–3 min)
+- Restart: `vastai start instance 48261525` (warm ~2–3 min: artifact is on
+  the 50 GB overlay; a full cold pull only happens after a recreate — ~17 min
+  measured 2026-08-21 at ~19 MiB/s with HF_TOKEN)
 - State file `vast-instance-id` (next to this runbook) tracks the live id for
   `fleet.sh` / `refresh-dsh-endpoint.sh`.
+- **Actual engine context (2026-08-21, measured via `ps` on both fleets):
+  text engines `--max-context 254976`, vision engines 196608.** The
+  entrypoint auto-sizes ctx to KV fit (hard cap 262144); on a 32607 MiB card
+  the fit is 254976. The pool/DSH 262144 declaration is the upper bound —
+  requests above 254976 are cleanly rejected. The env var
+  `NINFER_TEXT_CONTEXT` in the template is a PHANTOM (this entrypoint never
+  reads it; the real knob is `NINFER_MAX_CONTEXT`, left unset for auto-sizing).
 
 ### Port stability (verified 2026-08-20)
 
