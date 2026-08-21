@@ -1,0 +1,51 @@
+{
+  "_note": "Example config for pool-balancer.py (stdlib-only fallback). The real config carries live API keys: keep it OUT of git (gitignored as pool-balancer.json), chmod 600, point POOL_BALANCER_CONFIG at it. Primary pool layer is litellm-config.yaml via `fleet.sh pool start`.",
+  "listen": {
+    "bind": "0.0.0.0",
+    "text": 8800,
+    "vision": 8801
+  },
+  "health_interval_sec": 15,
+  "health_timeout_sec": 5,
+  "pools": {
+    "text": [
+      {
+        "name": "vast-8x5090",
+        "scheme": "http",
+        "host": "VAST_IP",
+        "port": 40461,
+        "key": "VAST_FLEET_KEY"
+      },
+      {
+        "name": "runpod-7x5090",
+        "scheme": "https",
+        "host": "POD_ID-8000.proxy.runpod.net",
+        "port": 443,
+        "key": "RUNPOD_FLEET_KEY"
+      },
+      {
+        "name": "local-5090",
+        "scheme": "http",
+        "host": "192.168.8.15",
+        "port": 8000,
+        "key": "LOCAL_ENGINE_KEY"
+      }
+    ],
+    "vision": [
+      {
+        "name": "runpod-7x5090",
+        "scheme": "https",
+        "host": "POD_ID-8001.proxy.runpod.net",
+        "port": 443,
+        "key": "RUNPOD_FLEET_KEY"
+      },
+      {
+        "name": "vast-8x5090",
+        "scheme": "http",
+        "host": "VAST_IP",
+        "port": 40462,
+        "key": "VAST_FLEET_KEY"
+      }
+    ]
+  }
+}

@@ -72,6 +72,40 @@ Use with `provider: ninfer-8x5090`, `model: qwen3.8-27b` (verified via a live
 workflow subagent). Vision needs `-p 8001:8001` published at instance-create
 time; the commented provider block in `settings.yaml` is ready for it.
 
+## Fleet control (fleet.sh)
+
+The Vast fleet and the RunPod 7×5090 fleet (`ee29h260cf8cwh`, $6.93/hr,
+`lroel/ninfer-pod-multi:v6`) are started/stopped as a unit by
+`fleet.sh` in this directory:
+
+```bash
+./fleet.sh status            # state + /health + $/hr for both fleets + local
+./fleet.sh up                # start anything stopped, wait for /health (≤10 min),
+                             # refresh DSH routes, write /code/llm-cluster/fleet-endpoints.json
+./fleet.sh down              # stop both (GPU billing stops; runpod 30 GB volume
+                             # still bills ~$0.44/mo)
+./fleet.sh register          # one-time: add ninfer-7x5090 to ~/.dsh/settings.yaml
+./fleet.sh up vast           # target a single fleet (runpod / both)
+```
+
+- **Vast:** `vastai stop/start instance` — host ports and disk survive; the
+  onstart entrypoint relaunches engines + balancers, so `up` only waits on
+  `/health` (~2–5 min warm).
+- **RunPod:** `runpodctl pods stop/start` — container disk is wiped on stop;
+  the `.ninfer` artifact is cached on the 30 GB volume after the first start
+  (first cold start downloads ~20.5 GiB from HF and can exceed the 10-min
+  health budget — just rerun `fleet.sh up runpod`). The proxy URL
+  `https://ee29h260cf8cwh-{8000,8001}.proxy.runpod.net` is pinned to the pod
+  id and stable across stop/start.
+- `up` rewrites the `baseURL` of `ninfer-8x5090` (via
+  `refresh-dsh-endpoint.sh`) and `ninfer-7x5090` in `~/.dsh/settings.yaml`
+  (line-oriented, comments survive), and writes
+  `/code/llm-cluster/fleet-endpoints.json` for orchestrator discovery.
+- Not managed (always on): local winbox 5090 (`192.168.8.15:8000`) and the
+  RunPod TP2 pod `bdawwwyiyc1ih3` (DSH agent-default model).
+- Env overrides: `VAST_INSTANCE`, `RUNPOD_POD`, `DSH_SETTINGS`,
+  `ENDPOINTS_FILE`, `WAIT_SECONDS`.
+
 ## Standing up the fleet by hand
 
 Scripts live on the instance at `/root/`:
@@ -120,6 +154,39 @@ curl -s -o /dev/null -w "vision:%{http_code}\n" 127.0.0.1:8001/health
    only *destroy* wipes it. No 8×5090 CUDA≥13.1 host currently offers Vast
    volumes (checked all 64 volume-offering machines — zero overlap).
 
+## Recreate from templates (fast path)
+
+Both platforms have a private template with the full recipe baked in
+(image v6, ports 8000/8001/22, env incl. artifact SHA, **HF_TOKEN** for
+authenticated artifact pulls, sha256-verified artifact):
+
+- **RunPod `g9xde4knct`** (`ninfer-multi-5090`, 30 GB volume @ `/models`,
+  20 GB container disk) — N-GPU general (this is what the 7×5090 pod was
+  created from):
+  ```bash
+  # --network-volume-id re-attaches the existing 30 GB volume (hltyh6zlfy,
+  # "ninfer-vllm-ro") so the cached .ninfer artifact survives a recreate;
+  # without it the pod gets a fresh volume and re-pulls from HF.
+  runpodctl pods create --template-id g9xde4knct --gpu-count 7 \
+    --network-volume-id hltyh6zlfy
+  # first cold start pulls the artifact (HF_TOKEN baked in); the volume cache
+  # then survives stop/start
+  ```
+- **Vast `583526`** (`ninfer-8x5090`, 80 GB disk, onstart entrypoint,
+  baked offer filters: 8+× RTX_5090, CUDA ≥13.1, verified, rentable):
+  ```bash
+  vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true' -o dph
+  vastai create instance <OFFER_ID> --template_hash 05f0622c335b14dfcda852dfbf228b7c
+  vastai attach ssh <NEW_ID> "$(cat ~/.ssh/id_ed25519.pub)"
+  /code/llm-cluster/ninfer-multi/refresh-dsh-endpoint.sh <NEW_ID>   # ports rotate on recreate
+  ```
+
+Note: both templates store `NINFER_API_KEY` and `HF_TOKEN` in their env;
+treat the templates as secret-bearing (template-visible to the account).
+
+The manual command below is the reference/fallback if a template ever needs
+rebuilding.
+
 ## Rebuilding from scratch
 
 ```bash
@@ -142,41 +209,34 @@ later as `text/layers/0/mlp/gate_up: divisor must be finite and positive`.
 - MTP: 3.27–3.48 tokens/round, **75–83% acceptance**
 - model load **~3.8 s** from local NVMe
 
----
+## Pool layer (LiteLLM)
 
-## RunPod (alternative to Vast)
+One LiteLLM router on the always-on DSH host balances the whole pool behind a
+single OpenAI-compatible endpoint:
 
-The same image runs on RunPod; only the provisioning differs.
+    http://<dsh-host>:8800/v1      model "qwen3.8-27b"        (text; vast + runpod + local)
+    http://<dsh-host>:8800/v1      model "qwen3.8-27b-vision" (vision; fleet :8001 balancers)
 
-**Template `g9xde4knct` — `ninfer-multi-5090`** (`lroel/ninfer-pod-multi:v6`,
-20 GB container disk + 40 GB volume at `/workspace`, ports 8000/8001/22).
-
-```bash
-runpodctl pod create --template-id g9xde4knct \
-  --name ninfer-8x5090 \
-  --gpu-id "NVIDIA GeForce RTX 5090" --gpu-count 8 \
-  --min-cuda-version 13.1 \
-  --env '{"NINFER_API_KEY":"<key>"}' \
-  --stop-after "$(date -u -d '+12 hours' +%Y-%m-%dT%H:%M:%SZ)"
-```
-
-`--min-cuda-version 13.1` is mandatory: ninfer's CMake floor is CUDA 13.1 and
-GeForce cards have no forward compatibility, so a 13.0 host cannot run the
-image at all.
-
-### Differences that matter
-
-| | Vast | RunPod |
-|---|---|---|
-| 8×5090 availability | listed regularly | **often unavailable** — 4× scheduled fine, 8× returned "no longer any instances" |
-| ~4×5090 price | — | ~$3.96/hr |
-| Container disk across stop/start | persists | **wiped** — only the volume survives |
-| Host port | stable across stop/start | **rotates on every restart** |
-| HTTP access | published host port | `https://<pod-id>-8000.proxy.runpod.net` (Cloudflare; send `User-Agent: curl/8.5.0` or requests are 403'd) |
-
-Because RunPod wipes the container disk on stop, the volume mount is not
-optional there — without it the 21.5 GB artifact re-downloads on every start.
-
-If 8 GPUs are unavailable, the fleet scales down cleanly: engine count follows
-the visible GPU count, and `NINFER_TEXT_ENGINES` controls the text/vision split
-(e.g. `NINFER_TEXT_ENGINES=3` on a 4-GPU pod gives 3 text + 1 vision).
+- Manage: `fleet.sh pool start|stop|status` (config: `litellm-config.yaml`
+  next to this file; log: `/code/llm-cluster/litellm.log`).
+- Install: `python3 -m venv /opt/litellm && /opt/litellm/bin/pip install
+  'litellm[proxy]'`, then **pin `fastapi==0.140.0`** — litellm 1.97.x requires
+  `get_flat_dependant`, which fastapi ≥0.141 removed.
+- Keys come from the environment (repo is public, nothing secret in the
+  config): `fleet.sh pool start` loads `~/.dsh/.credentials.yaml`
+  (`NINFER_VAST_API_KEY`, `NINFER_RUNPOD_API_KEY` — distinct per fleet,
+  `VLLM_API_KEY`, `NINFER_POOL_API_KEY` master key for clients) and injects
+  `NINFER_POOL_VAST_BASE` from the live Vast mapping.
+- Routing: least-busy (in-flight per deployment), `num_retries: 2`,
+  `allowed_fails: 1` / `cooldown_time: 30` — a dead fleet (a stopped RunPod
+  pod 404s via its proxy, which litellm classifies as a non-retryable client
+  404) is excluded after ONE failure and re-admitted within 30 s of recovery.
+  **`num_workers` must stay 1**: uvicorn workers are separate processes with
+  separate in-memory router state, which fragments least-busy and multiplies
+  the fails needed for cooldown by the worker count. The server is async, so
+  one process handles all concurrent streams.
+- Verified: with one deployment dead, 4/4 parallel completions succeeded via
+  the healthy fleets (2026-08-21).
+- Fallback (zero-dependency): `pool-balancer.py` — stdlib-only least-connections
+  relay with per-upstream auth rewrite (config `pool-balancer.json` from
+  `pool-balancer.json.example`; never commit the real one).

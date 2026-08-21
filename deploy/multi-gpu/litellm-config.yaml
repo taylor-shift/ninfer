@@ -1,0 +1,90 @@
+# LiteLLM Router config for the qwen3.8-27b worker pool.
+#
+# Balances OpenAI-compatible traffic across the whole pool with least-busy
+# routing (in-flight per deployment), per-deployment API keys, and automatic
+# cooldown of failing deployments. Each deployment here is a fleet's front
+# balancer (balancer.pl), which itself least-connections across that fleet's
+# engines — two-level least-connections, same philosophy as the in-fleet
+# balancer.
+#
+# Keys never live in this file (the repo is public): they come from the
+# process environment. `fleet.sh pool start` loads ~/.dsh/.credentials.yaml
+# into the environment:
+#   NINFER_VAST_API_KEY      Vast 8x5090 fleet key
+#   NINFER_RUNPOD_API_KEY    RunPod 7x5090 fleet key
+#   VLLM_API_KEY             local winbox 5090 key
+#   NINFER_POOL_API_KEY      master key for THIS proxy (clients must send it)
+#   NINFER_POOL_VAST_BASE    Vast text base, e.g. http://1.2.3.4:40461/v1
+#                            (rotates when the Vast instance is recreated;
+#                            fleet.sh injects the current value from vastai)
+#   NINFER_POOL_VAST_VISION_BASE  (same, for :8001; enables the Vast vision
+#                            deployment when set)
+#
+# Run: litellm --config litellm-config.yaml --port 8800 --host 0.0.0.0
+#
+# Clients:
+#   text:   model "qwen3.8-27b"       (262144 ctx per stream)
+#   vision: model "qwen3.8-27b-vision" (196608 ctx; each fleet's last 2 cards)
+
+model_list:
+  # ---- text pool ------------------------------------------------------
+  - model_name: qwen3.8-27b
+    litellm_params:
+      model: openai/qwen3.8-27b
+      api_base: ${NINFER_POOL_VAST_BASE}
+      api_key: os.environ/NINFER_VAST_API_KEY
+    litellm_model_name: vast-8x5090
+
+  - model_name: qwen3.8-27b
+    litellm_params:
+      model: openai/qwen3.8-27b
+      api_base: https://ee29h260cf8cwh-8000.proxy.runpod.net/v1
+      api_key: os.environ/NINFER_RUNPOD_API_KEY
+    litellm_model_name: runpod-7x5090
+
+  - model_name: qwen3.8-27b
+    litellm_params:
+      model: openai/qwen3.8-27b
+      api_base: http://192.168.8.15:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+    litellm_model_name: local-5090
+
+  # ---- vision pool ----------------------------------------------------
+  - model_name: qwen3.8-27b-vision
+    litellm_params:
+      model: openai/qwen3.8-27b
+      api_base: https://ee29h260cf8cwh-8001.proxy.runpod.net/v1
+      api_key: os.environ/NINFER_RUNPOD_API_KEY
+    litellm_model_name: runpod-7x5090-vision
+
+  # Vast vision: enabled at startup when NINFER_POOL_VAST_VISION_BASE is set
+  # (the running Vast instance publishes :8001 since the 2026-08-21 recreate,
+  # template 583526). Kept as a comment because LiteLLM hard-fails on a
+  # deployment whose env ref is empty.
+  # - model_name: qwen3.8-27b-vision
+  #   litellm_params:
+  #     model: openai/qwen3.8-27b
+  #     api_base: ${NINFER_POOL_VAST_VISION_BASE}
+  #     api_key: os.environ/NINFER_VAST_API_KEY
+  #   litellm_model_name: vast-8x5090-vision
+
+router_settings:
+  routing_strategy: least-busy     # in-flight per deployment, like balancer.pl
+  num_retries: 2                   # retries go through the router (fresh pick)
+  allowed_fails: 1                 # a dead fleet is excluded after ONE failure —
+  cooldown_time: 30                # critical: a stopped RunPod pod 404s via its
+                                   # proxy and litellm classifies 404 as
+                                   # non-retryable client error, so the ONLY
+                                   # failover path is fast exclusion here.
+                                   # 30s cooldown = back in rotation fast on recovery.
+  request_timeout: 900             # long-context generations run for minutes
+  # num_workers: MUST stay 1 (default). Uvicorn workers are separate processes
+  # with SEPARATE in-memory router state: >1 workers breaks least-busy
+  # (per-worker in-flight blind spots) and multiplies the fails needed for
+  # cooldown by the worker count. The server is async — one process handles
+  # all concurrent streams.
+  num_workers: 1
+  max_parallel_requests: 64
+
+general_settings:
+  master_key: os.environ/NINFER_POOL_API_KEY   # clients must send this key
