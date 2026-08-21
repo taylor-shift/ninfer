@@ -433,7 +433,7 @@ VAST_OFFER_FILTER="${VAST_OFFER_FILTER:-num_gpus>=8 gpu_name=RTX_5090 cuda_vers>
 VAST_NEW_WAIT="${VAST_NEW_WAIT:-900}"
 
 cmd_vast_new() {
-  local existing offers offer out id ip p8000 p8001 waited code
+  local existing offers offer out id ip p8000 p8001 waited code specout disk img
   # 1. Refuse while a Vast instance is running/starting (no double billing).
   existing="$(vastai show instances --raw 2>/dev/null | python3 -c '
 import json, sys
@@ -470,6 +470,24 @@ print(",".join(str(i.get("id")) for i in insts
     echo "all offers rejected — template broken? (update template is REPLACE: re-issue the FULL spec, see RUNBOOK-vast.md)" >&2
     return 1
   fi
+  # Verify the spec we actually got: --disk is a request the API can silently
+  # downgrade to 10 GB, and a wrong spec here means a doomed (billed) instance.
+  # A 20.5 GB artifact needs >= ~45 GB, so fail fast and destroy.
+  local tries=0 disk=""
+  while (( tries < 6 )); do
+    sleep 5; tries=$(( tries + 1 ))
+    specout="$(vastai show instance "$id" --raw 2>/dev/null || true)"
+    disk="$(echo "$specout" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("disk_space") or "")' 2>/dev/null || true)"
+    # API reports floats ("50.0"); prefix-match is safe (50* != 10.0/80.0).
+    [[ "$disk" == "$VAST_DISK_GB"* ]] && break
+  done
+  if [[ "$disk" != "$VAST_DISK_GB"* ]]; then
+    echo "created instance $id got ${disk:-?} GB disk, not ${VAST_DISK_GB} — destroying (API downgraded --disk)" >&2
+    vastai destroy instance "$id" --yes >/dev/null 2>&1 || true
+    return 1
+  fi
+  img="$(echo "$specout" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("image_name") or d.get("image_uuid") or "")' 2>/dev/null || true)"
+  [[ "$img" == *":v6"* || -z "$img" ]] || echo "warning: instance $id has image '$img' (expected v6)" >&2
   vastai attach ssh "$id" "$(cat ~/.ssh/id_ed25519.pub)" >/dev/null 2>&1 || true
   echo "$id" > "$VAST_STATE_FILE"
   VAST_INSTANCE="$id"
