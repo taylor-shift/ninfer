@@ -428,12 +428,115 @@ cmd_pool() {
 #     NEW instance (double billing) — never use it on a running fleet.
 
 VAST_TEMPLATE_HASH="${VAST_TEMPLATE_HASH:-dd2a1614c1bf092ffb5f84ca330458ed}"
+VAST_TEMPLATE_STATE="${VAST_TEMPLATE_STATE:-$SCRIPT_DIR/vast-template-state}"
+VAST_TEMPLATE_NAME="${VAST_TEMPLATE_NAME:-ninfer-8x5090}"
+VAST_TEMPLATE_ONSTART="mkdir -p /workspace && /usr/local/bin/ninfer-multi-entrypoint"
 VAST_DISK_GB="${VAST_DISK_GB:-50}"
 VAST_OFFER_FILTER="${VAST_OFFER_FILTER:-num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true verified=true}"
 VAST_NEW_WAIT="${VAST_NEW_WAIT:-900}"
 
+# The repo is the single source of truth for the Vast template; the template
+# itself is a synced artifact (like the Docker image). The spec below carries
+# NO secrets: NINFER_API_KEY comes from NINFER_VAST_API_KEY in the credentials
+# file, HF_TOKEN from /root/.config/hf/env (both resolved at sync time).
+vast_template_env() {
+  local hf
+  hf="$(grep -oP 'HF_TOKEN=\K\S+' /root/.config/hf/env 2>/dev/null | head -1)"
+  [[ -n "${NINFER_VAST_API_KEY:-}" && -n "$hf" ]] || return 1
+  echo "-p 8000:8000 -p 8001:8001 \
+-e NINFER_API_KEY=${NINFER_VAST_API_KEY} \
+-e NINFER_MODEL=neroued/Qwen3.8-27B-nvfp4-NInfer \
+-e NINFER_ARTIFACT=qwen3_8_27b_nvfp4.ninfer \
+-e NINFER_ARTIFACT_SHA256=bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32 \
+-e NINFER_VOLUME_PATH=/workspace \
+-e HF_TOKEN=${hf} \
+-e NINFER_KV_DTYPE=int8 -e NINFER_KV_CAPACITY=auto -e NINFER_MAX_CONCURRENCY=2 \
+-e NINFER_SPEC=mtp -e NINFER_DRAFT_TOKENS=3 -e NINFER_LM_HEAD_DRAFT=1 \
+-e NINFER_TEXT_CONTEXT=262144 -e NINFER_VISION=1 -e NINFER_VISION_CONTEXT=196608 \
+-e NINFER_ALLOW_ARIA2=0 -e NINFER_DOWNLOAD_CONNECTIONS=16 -e NINFER_PROFILE=auto \
+-e NINFER_START_STAGGER_S=5 -e NINFER_PENDING_TIMEOUT_MS=120000 \
+-e NINFER_PRESERVE_THINKING=1 -e NINFER_ENABLE_SSHD=1 -e PORT=8000"
+}
+
+vast_template_hash_current() {
+  local line
+  [[ -f "$VAST_TEMPLATE_STATE" ]] && line="$(tail -1 "$VAST_TEMPLATE_STATE")" &&
+    [[ "$line" =~ [0-9a-f]{40} ]] && { echo "${line##* }"; return; }
+  echo "$VAST_TEMPLATE_HASH"
+}
+
+cmd_vast_template_sync() {
+  # (Re)apply the canonical spec from this file to the account's template.
+  # update template has REPLACE semantics -> always the FULL spec. The hash
+  # rotates on every update AND on any console save; if the known hash is
+  # stale (console re-save), create a fresh template from the spec, delete
+  # the old one by id, and persist the new pair.
+  load_credentials || return 1
+  local hf out old_id old_hash new_hash new_id
+  hf="$(grep -oP 'HF_TOKEN=\K\S+' /root/.config/hf/env 2>/dev/null | head -1)"
+  [[ -n "$hf" ]] || { echo "HF_TOKEN not found in /root/.config/hf/env" >&2; return 1; }
+  [[ -n "${NINFER_VAST_API_KEY:-}" ]] || { echo "NINFER_VAST_API_KEY missing from $CREDENTIALS" >&2; return 1; }
+  old_id=""; old_hash=""
+  [[ -f "$VAST_TEMPLATE_STATE" ]] && read -r old_id old_hash < <(tail -1 "$VAST_TEMPLATE_STATE") || true
+
+  if [[ -n "$old_hash" ]]; then
+    out="$(vastai update template "$old_hash" \
+      --name "$VAST_TEMPLATE_NAME" --image lroel/ninfer-pod-multi --image_tag v6 \
+      --disk_space "$VAST_DISK_GB" --ssh --direct \
+      --env "$(vast_template_env)" \
+      --onstart-cmd "$VAST_TEMPLATE_ONSTART" \
+      --search_params "$VAST_OFFER_FILTER" 2>&1 || true)"
+    new_hash="$(echo "$out" | grep -oP '"hash_id":\s*"\K[0-9a-f]+' | head -1)"
+    if [[ -n "$new_hash" ]]; then
+      echo "$old_id $new_hash" > "$VAST_TEMPLATE_STATE"
+      echo "template synced in place (id ${old_id:-?}, new hash ${new_hash:0:8}…)"
+      return 0
+    fi
+    echo "update failed (stale hash? console re-save?): $(echo "$out" | head -c 110)" >&2
+  fi
+  # Hash unknown or stale: fresh create from the canonical spec.
+  [[ -n "$old_id" ]] && vastai delete template --template-id "$old_id" >/dev/null 2>&1 \
+    && echo "deleted stale template id $old_id" >&2
+  out="$(vastai create template \
+      --name "$VAST_TEMPLATE_NAME" --image lroel/ninfer-pod-multi --image_tag v6 \
+      --disk_space "$VAST_DISK_GB" --ssh --direct \
+      --env "$(vast_template_env)" \
+      --onstart-cmd "$VAST_TEMPLATE_ONSTART" \
+      --search_params "$VAST_OFFER_FILTER" \
+      --desc 'ninfer 8x5090 split fleet: 6 text engines @262144 ctx (:8000) + 2 vision engines @196608 ctx (:8001), C=2, int8 KV, MTP3. Requires CUDA>=13.1. Synced from the ninfer fork (deploy/multi-gpu/fleet.sh) — do not edit in the console; re-sync with fleet.sh vast template-sync. Never use the console recreate button on a running instance.' 2>&1 || true)"
+  new_hash="$(echo "$out" | grep -oP '"hash_id":\s*"\K[0-9a-f]+' | head -1)"
+  new_id="$(echo "$out" | grep -oP '"id":\s*\K[0-9]+' | head -1)"
+  [[ -n "$new_hash" && -n "$new_id" ]] || {
+    echo "template create failed: $(echo "$out" | head -c 160)" >&2; return 1; }
+  echo "$new_id $new_hash" > "$VAST_TEMPLATE_STATE"
+  echo "template created from repo spec (id $new_id, hash ${new_hash:0:8}…) — GUI: Templates -> $VAST_TEMPLATE_NAME"
+}
+
+# Offer loop extracted so a stale template hash can trigger one sync+retry.
+NEW_ID=""; LAST_CREATE_ERR=""
+vast_new_try_offers() {  # $1 = template hash
+  NEW_ID=""; LAST_CREATE_ERR=""
+  local offers offer out
+  offers="$(vastai search offers "$VAST_OFFER_FILTER" -o dph 2>/dev/null |
+            sed 's/\x1b\[[0-9;]*m//g' | awk 'NR>1 {print $2}')"
+  [[ -n "$offers" ]] || { echo "no matching offers ($VAST_OFFER_FILTER)" >&2; return 2; }
+  while read -r offer; do
+    [[ -n "$offer" ]] || continue
+    out="$(vastai create instance "$offer" --template_hash "$1" \
+             --disk "$VAST_DISK_GB" 2>&1 || true)"
+    if echo "$out" | grep -q 'success.*True'; then
+      NEW_ID="$(echo "$out" | grep -oP '"new_contract":\s*\K[0-9]+' | head -1)"
+      echo "created instance $NEW_ID from offer $offer (${VAST_DISK_GB} GB disk)"
+      return 0
+    fi
+    echo "offer $offer rejected: $(echo "$out" | head -c 90)"
+    LAST_CREATE_ERR="$out"
+  done <<< "$offers"
+  return 1
+}
+
 cmd_vast_new() {
-  local existing offers offer out id ip p8000 p8001 waited code specout disk img
+  local existing out id ip p8000 p8001 waited code specout disk img
   # 1. Refuse while a Vast instance is running/starting (no double billing).
   existing="$(vastai show instances --raw 2>/dev/null | python3 -c '
 import json, sys
@@ -446,28 +549,25 @@ print(",".join(str(i.get("id")) for i in insts
     echo "Vast instance(s) already up: $existing — stop/destroy first (no double billing)" >&2
     return 1
   fi
-  # 2. Offers, cheapest first; try each until one takes.
-  offers="$(vastai search offers "$VAST_OFFER_FILTER" -o dph 2>/dev/null |
-            sed 's/\x1b\[[0-9;]*m//g' | awk 'NR>1 {print $2}')"
-  if [[ -z "$offers" ]]; then
-    echo "no matching offers ($VAST_OFFER_FILTER)" >&2
-    return 1
-  fi
+  # 2. Offers, cheapest first; try each until one takes. If every offer fails
+  #    with a stale template hash (console re-saved the template), re-sync the
+  #    template from the repo spec and retry once.
+  local tpl_hash
+  tpl_hash="$(vast_template_hash_current)"
   id=""
-  while read -r offer; do
-    [[ -n "$offer" ]] || continue
-    out="$(vastai create instance "$offer" --template_hash "$VAST_TEMPLATE_HASH" \
-             --disk "$VAST_DISK_GB" 2>&1 || true)"
-    if echo "$out" | grep -q 'success.*True'; then
-      id="$(echo "$out" | grep -oP '"new_contract":\s*\K[0-9]+' | head -1)"
-      echo "created instance $id from offer $offer (${VAST_DISK_GB} GB disk)"
-      break
-    else
-      echo "offer $offer rejected: $(echo "$out" | head -c 90)"
+  if vast_new_try_offers "$tpl_hash"; then
+    id="$NEW_ID"
+  elif echo "$LAST_CREATE_ERR" | grep -qi 'invalid template\|template hash'; then
+    echo "template hash stale — re-syncing from repo spec, retrying..." >&2
+    if cmd_vast_template_sync; then
+      tpl_hash="$(vast_template_hash_current)"
+      if vast_new_try_offers "$tpl_hash"; then
+        id="$NEW_ID"
+      fi
     fi
-  done <<< "$offers"
+  fi
   if [[ -z "$id" ]]; then
-    echo "all offers rejected — template broken? (update template is REPLACE: re-issue the FULL spec, see RUNBOOK-vast.md)" >&2
+    echo "all offers rejected — template broken? (see 'fleet.sh vast template-sync')" >&2
     return 1
   fi
   # Verify the spec we actually got: --disk is a request the API can silently
@@ -531,7 +631,10 @@ case "$cmd" in
   down)     shift; cmd_down "${1:-both}" ;;
   register) shift; cmd_register "$@" ;;
   pool)     shift; cmd_pool "${1:-status}" ;;
-  vast)     [[ "${2:-}" == "new" ]] && { cmd_vast_new; exit; }
-            echo "usage: fleet.sh vast new" >&2; exit 2 ;;
-  *) echo "usage: fleet.sh {status|up|down|register|pool|vast new} [vast|runpod]" >&2; exit 2 ;;
+  vast)     case "${2:-}" in
+              new)           cmd_vast_new; exit ;;
+              template-sync) cmd_vast_template_sync; exit ;;
+              *) echo "usage: fleet.sh vast {new|template-sync}" >&2; exit 2 ;;
+            esac ;;
+  *) echo "usage: fleet.sh {status|up|down|register|pool|vast new|vast template-sync} [vast|runpod]" >&2; exit 2 ;;
 esac

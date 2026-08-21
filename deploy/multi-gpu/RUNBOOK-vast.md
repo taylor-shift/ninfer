@@ -203,6 +203,30 @@ curl -s -o /dev/null -w "vision:%{http_code}\n" 127.0.0.1:8001/health
 
 ## Recreate from templates (fast path)
 
+**The repo is the single source of truth for the Vast template.** The
+template is a synced artifact: its full spec (name, image, tag, env, onstart,
+disk, offer filter) lives in `fleet.sh` (`vast_template_env` /
+`cmd_vast_template_sync`), secrets resolved at sync time from
+`/root/.dsh/.credentials.yaml` (NINFER_VAST_API_KEY) and
+`/root/.config/hf/env` (HF_TOKEN). Current template: **584160**
+(`ninfer-8x5090`, private — visible in the GUI; the GUI create works, the
+recommended 50 GB disk is pre-filled).
+
+```bash
+fleet.sh vast template-sync   # (re)apply the repo spec: update in place (full
+                              # spec — REPLACE semantics), and if the hash is
+                              # stale (console re-saved it) delete + recreate
+                              # from the spec, persisting id+hash in
+                              # vast-template-state
+fleet.sh vast new             # zero -> healthy repointed fleet; auto-runs
+                              # template-sync + retries on a stale hash;
+                              # refuses while an instance is live; verifies
+                              # disk+image post-create
+```
+The template hash rotates on every update and on any console save; the state
+file (`vast-template-state`, gitignored) holds the live pair, so neither the
+CLI path nor this runbook ever hard-codes a hash.
+
 Both platforms have a private template with the full recipe baked in
 (image v6, ports 8000/8001/22, env incl. artifact SHA, **HF_TOKEN** for
 authenticated artifact pulls, sha256-verified artifact):
@@ -228,11 +252,14 @@ authenticated artifact pulls, sha256-verified artifact):
   (`num_gpus>=8, gpu_name=RTX_5090, cuda_max_good>=13.1, rentable, verified`)
   so the GUI only lists suitable hosts:
   ```bash
+  THASH=$(awk '{print $2}' deploy/multi-gpu/vast-template-state)   # live hash (repo-synced)
   vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true verified=true' -o dph
-  vastai create instance <OFFER_ID> --template_hash 91db200ac7774133b100da2078bf7265 --disk 50
+  vastai create instance <OFFER_ID> --template_hash "$THASH" --disk 50
   vastai attach ssh <NEW_ID> "$(cat ~/.ssh/id_ed25519.pub)"
   /code/llm-cluster/ninfer-multi/refresh-dsh-endpoint.sh <NEW_ID>   # ports rotate on recreate
   ```
+  (Prefer `fleet.sh vast new` — it does all of this plus the health wait,
+  spec verify, and DSH+pool repoint.)
   **Disk gotcha:** the template's `disk_space` (50) is a RECOMMENDATION shown
   in the GUI; the CLI defaults to 10 GB unless you pass `--disk 50`. The
   20.5 GB artifact needs ≥50 GB. In the GUI the recommended 50 GB is

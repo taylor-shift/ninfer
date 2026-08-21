@@ -50,3 +50,4 @@ deploy/multi-gpu/pool-balancer.json
 deploy/multi-gpu/vast-instance-id
 deploy/multi-gpu/*.log
 deploy/multi-gpu/vast-vision-base
+deploy/multi-gpu/vast-template-state
