@@ -478,7 +478,7 @@ cmd_pool() {
 # Vast platform quirks this encodes (learned 2026-08-21, both cost money):
 #   * --disk is a CREATE-TIME flag; the template's --disk_space does NOT size
 #     the container disk (defaulted to 10 GB = guaranteed artifact-pull
-#     failure). Default here: 50 GB (20.5 GB artifact + headroom).
+#     failure). Default here: 50 GB (21.5 GB artifact + headroom).
 #   * `update template` has REPLACE semantics — a partial update (e.g. only
 #     --disk_space) WIPES the other fields (image/env/onstart), after which
 #     every create fails "400: Invalid args". Always re-issue the FULL spec.
@@ -631,7 +631,7 @@ print(",".join(str(i.get("id")) for i in insts
   fi
   # Verify the spec we actually got: --disk is a request the API can silently
   # downgrade to 10 GB, and a wrong spec here means a doomed (billed) instance.
-  # A 20.5 GB artifact needs >= ~45 GB, so fail fast and destroy.
+  # A 21.5 GB artifact needs >= ~45 GB, so fail fast and destroy.
   local tries=0 disk=""
   while (( tries < 6 )); do
     sleep 5; tries=$(( tries + 1 ))

@@ -32,13 +32,15 @@ the single-GPU number; the win is in aggregate throughput and concurrency.
 ## Usage
 
 ```bash
+export NINFER_ARTIFACT_PATH=/workspace/qwen3_8_27b_nvfp4.ninfer
 export NINFER_API_KEY='<key>'
-./ninfer-multi.sh /workspace/qwen3_8_27b_nvfp4.ninfer
+./entrypoint.sh
 ```
 
 On a 7×5090 host that starts 7 engines on `127.0.0.1:18080..18086` (each pinned
-with `--device i`) and the balancer on `:8000`. Point any OpenAI client at
-`http://<host>:8000/v1`.
+to its card via `CUDA_VISIBLE_DEVICES=i ... --device 0` — `--device i` is
+broken on multi-GPU hosts, see the RUNBOOK) and the balancer on `:8000`. Point
+any OpenAI client at `http://<host>:8000/v1`.
 
 ### Knobs
 

@@ -129,7 +129,7 @@ skipped (set `RUNPOD_POD=<new-id>` to re-enable):
   `/health` (~2–5 min warm).
 - **RunPod:** `runpodctl pods stop/start` — container disk is wiped on stop;
   the `.ninfer` artifact is cached on the 30 GB volume after the first start
-  (first cold start downloads ~20.5 GiB from HF and can exceed the 10-min
+  (first cold start downloads ~20 GiB (21.5 GB) from HF and can exceed the 10-min
   health budget — just rerun `fleet.sh up runpod`). The proxy URL
   `https://<podid>-{8000,8001}.proxy.runpod.net` is pinned to the pod id and
   stable across stop/start. (Pod `ee29h260cf8cwh` was deleted 2026-08-21;
@@ -265,7 +265,7 @@ authenticated artifact pulls, sha256-verified artifact):
   spec verify, and DSH+pool repoint.)
   **Disk gotcha:** the template's `disk_space` (50) is a RECOMMENDATION shown
   in the GUI; the CLI defaults to 10 GB unless you pass `--disk 50`. The
-  20.5 GB artifact needs ≥50 GB. In the GUI the recommended 50 GB is
+  21.5 GB artifact needs ≥50 GB. In the GUI the recommended 50 GB is
   pre-filled — keep it.
   (Older templates `583526` and `582886` are superseded/deleted; keep exactly
   one. `vastai update template <hash> ...` updates in place; the hash changes
