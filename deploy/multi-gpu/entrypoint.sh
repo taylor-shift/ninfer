@@ -445,21 +445,36 @@ while true; do
     (( waited % 60 == 0 )) && log "  ${ready}/${GPUS} ready, ${alive} loading (${waited}s)"
 
     # Past the soft budget, start serving with whatever is up rather than
-    # waiting for the slowest engine.
+    # waiting for the slowest engine. Engines that finish loading afterwards are
+    # NOT added (the balancers get a fixed port list at start): they run billed
+    # but unrouted until the pod is restarted.
     if (( waited >= READY_TIMEOUT_S && ready > 0 && announced_partial == 0 )); then
-        log "soft budget reached: starting balancer with ${ready}/${GPUS} ready; the rest join as they finish"
+        log "soft budget reached: starting balancer with ${ready}/${GPUS} ready; engines still loading will not serve until the pod is restarted"
         announced_partial=1
         break
     fi
 done
 
-# Engines that were still loading are added once they answer /health, so the
-# balancer never routes to a port that is not serving yet.
+# Engines still loading are excluded so the balancer never routes to a port
+# that is not serving yet. Carry the DEVICE index through the filter: pool
+# classification below keys on it, not on the filtered array position (a
+# lower-index text engine dying while higher-index vision engines survive must
+# not reclassify the survivors).
 if (( ready < GPUS )); then
     live_ports=()
-    for p in "${engine_ports[@]}"; do probe_health "$p" && live_ports+=("$p"); done
-    log "balancer starts with ${#live_ports[@]} engine(s): ${live_ports[*]}"
+    live_idx=()
+    for idx in "${!engine_ports[@]}"; do
+        if probe_health "${engine_ports[$idx]}"; then
+            live_ports+=("${engine_ports[$idx]}")
+            live_idx+=("$idx")
+        fi
+    done
+    log "balancer starts with ${#live_ports[@]} engine(s): ${live_ports[*]} (devices ${live_idx[*]})"
     engine_ports=("${live_ports[@]}")
+    engine_idx=("${live_idx[@]}")
+else
+    engine_idx=()
+    for idx in "${!engine_ports[@]}"; do engine_idx+=("$idx"); done
 fi
 
 # --- 7. Balancer -------------------------------------------------------------
@@ -497,7 +512,7 @@ trap shutdown INT TERM
 #   :$((PORT+1)) -> vision engines   (media-capable, reduced context)
 text_ports=(); vision_ports=()
 for idx in "${!engine_ports[@]}"; do
-    if engine_is_vision "$idx"; then vision_ports+=("${engine_ports[$idx]}")
+    if engine_is_vision "${engine_idx[$idx]}"; then vision_ports+=("${engine_ports[$idx]}")
     else text_ports+=("${engine_ports[$idx]}"); fi
 done
 
