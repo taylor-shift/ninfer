@@ -45,7 +45,13 @@ if [[ "${NINFER_ENABLE_SSHD:-1}" == "1" ]] && command -v /usr/sbin/sshd >/dev/nu
     if [[ -n "${PUBLIC_KEY:-}" ]]; then
         mkdir -p /root/.ssh && chmod 700 /root/.ssh
         # PUBLIC_KEY may hold several keys; RunPod passes them newline separated.
-        printf '%s\n' "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+        # Dedupe: a respawned entrypoint re-appends the same lines, which would
+        # grow the file unboundedly.
+        while IFS= read -r key_line; do
+            [[ -z "${key_line//[[:space:]]/}" ]] && continue
+            grep -qxF "$key_line" /root/.ssh/authorized_keys 2>/dev/null \
+                || printf '%s\n' "$key_line" >> /root/.ssh/authorized_keys
+        done <<< "$PUBLIC_KEY"
         chmod 600 /root/.ssh/authorized_keys
         /usr/sbin/sshd -e 2>/dev/null && log "sshd started on :22"
     else
@@ -76,6 +82,11 @@ if [[ -z "$artifact" ]]; then
 
     resolve_artifact() {
         local root snap cand
+        # Honour the exact filename the download path uses: a generic *.ninfer
+        # scan can pick a sibling artifact with a different name than the one
+        # NINFER_ARTIFACT names (and the one a fresh download would fetch).
+        local name='*.ninfer'
+        [[ -n "${NINFER_ARTIFACT:-}" ]] && name="$NINFER_ARTIFACT"
         for root in "${search_roots[@]}"; do
             [[ -d "$root" ]] || continue
             # HF cache layout
@@ -88,12 +99,12 @@ if [[ -z "$artifact" ]]; then
                 fi
                 [[ -z "$snap" ]] && snap=$(find "${mr}/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -1)
                 if [[ -n "$snap" && -d "$snap" ]]; then
-                    cand=$(find "$snap" -maxdepth 1 \( -type f -o -type l \) -name '*.ninfer' 2>/dev/null | sort | head -1)
+                    cand=$(find "$snap" -maxdepth 1 \( -type f -o -type l \) -name "$name" 2>/dev/null | sort | head -1)
                     [[ -n "$cand" ]] && { artifact="$cand"; return 0; }
                 fi
             fi
             # Loose artifact directly under the root
-            cand=$(find "$root" -maxdepth 2 \( -type f -o -type l \) -name '*.ninfer' 2>/dev/null | sort | head -1)
+            cand=$(find "$root" -maxdepth 2 \( -type f -o -type l \) -name "$name" 2>/dev/null | sort | head -1)
             [[ -n "$cand" ]] && { artifact="$cand"; return 0; }
         done
         return 1
@@ -399,7 +410,10 @@ probe_health() {
         exec 3<>"/dev/tcp/127.0.0.1/$1" || return 1
         printf 'GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3
         local line
-        read -r line <&3 || { exec 3<&- 3>&-; return 1; }
+        # -t 3: an engine that accepts the connection but never answers (mid-load
+        # stall, half-dead process) must not stall the readiness loop — read on a
+        # /dev/tcp fd has no timeout of its own.
+        read -r -t 3 line <&3 || { exec 3<&- 3>&-; return 1; }
         exec 3<&- 3>&-
         [[ "$line" == *" 200"* ]]
     } 2>/dev/null
