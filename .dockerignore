@@ -20,6 +20,16 @@ models
 **/.venv
 **/venv
 
+# Local deploy secrets/state (gitignored, present on the live host) — the main
+# Dockerfile does `COPY . .` from the repo root, so keep them OUT of image
+# layers: pool-balancer.json carries every fleet's API key; the vast-* files
+# are per-host state.
+deploy/multi-gpu/pool-balancer.json
+deploy/multi-gpu/vast-instance-id
+deploy/multi-gpu/vast-vision-base
+deploy/multi-gpu/vast-template-state
+deploy/multi-gpu/litellm-venv
+
 *.bin
 *.gguf
 *.log
