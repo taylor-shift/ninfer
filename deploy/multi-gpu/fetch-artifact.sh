@@ -42,8 +42,10 @@ if [[ -f "$dest" ]]; then
 fi
 
 # Expected size, used to verify the transfer actually completed. HEAD follows the
-# redirect to the CDN, where Content-Length is authoritative.
-expected=$(curl -sIL ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} "$url" 2>/dev/null |
+# redirect to the CDN, where Content-Length is authoritative. -m 30: a hung HEAD
+# must not block the entrypoint forever (the download budget is enforced below;
+# this probe has no business consuming any of it).
+expected=$(curl -sIL -m 30 ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} "$url" 2>/dev/null |
     awk 'BEGIN{IGNORECASE=1} /^content-length:/ {v=$2} END{gsub(/\r/,"",v); print v}')
 [[ "$expected" =~ ^[0-9]+$ ]] || expected=""
 [[ -n "$expected" ]] && log "expected size: $(( expected / 1024 / 1024 )) MiB"
@@ -167,7 +169,13 @@ fi
 # --- 3. curl ----------------------------------------------------------------
 
 log "attempt 3/3: curl single stream (slow path)"
+# --speed-limit/--speed-time: abort (and let --retry resume via -C -) when the
+# transfer sustains < 1 KiB/s for 300s. --retry only covers transient
+# connection errors, so an accepted-then-idle connection (dead CDN edge) would
+# otherwise stall forever; a healthy transfer never dips that low for that
+# long, and a false positive just costs a resume.
 curl -fL --retry 5 --retry-delay 3 -C - --progress-bar \
+    --speed-limit 1024 --speed-time 300 \
     ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} \
     -o "$tmp" "$url" || fail "all download methods failed (partial kept at $tmp)"
 
