@@ -184,6 +184,13 @@ void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lane
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,
                                              std::span<const std::uint8_t> cancelled) {
+    // This is a CUDA entry point despite reading like bookkeeping: the
+    // speculative branch of impl_->resolve_pending_batch launches the
+    // gdn_replay_fold kernel to fold rejected draft tokens back into the GDN
+    // linear-attention state. Bind the calling thread like the other entry
+    // points rather than relying on it having been bound by the decode_batch
+    // that preceded it on the executor's single worker thread.
+    DeviceGuard guard(impl_->device);
     impl_->resolve_pending_batch(lanes, accepted_tokens, terminal, cancelled);
 }
 

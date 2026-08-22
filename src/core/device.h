@@ -58,8 +58,17 @@ struct DeviceContext {
     void bind_current_thread() const;
 };
 
-// RAII helper: binds ctx's device for the current scope. Use at the entry point
-// of any function that may run on a thread which did not create the context.
+// Binds ctx's device to the CALLING thread at construction. Use at the entry
+// point of any function that runs CUDA work and may execute on a thread which
+// did not create the context.
+//
+// The bind is NOT restored at destruction: there is no cudaSetDevice "unbind",
+// so once a thread is bound it stays bound for its lifetime. That is safe
+// because one process hosts one engine, so every thread that reaches engine
+// work converges on the same device. Do not add a restoring destructor:
+// later calls on the same thread rely on the bind having persisted, and
+// reverting to device 0 would re-expose the cudaErrorInvalidValue failure
+// mode on multi-GPU hosts.
 class DeviceGuard {
 public:
     explicit DeviceGuard(const DeviceContext& ctx) { ctx.bind_current_thread(); }
