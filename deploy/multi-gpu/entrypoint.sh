@@ -360,7 +360,12 @@ cleanup() {
     for pid in "${engine_pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
     wait 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# A platform stop (SIGTERM) or Ctrl-C during load must stop the container, not
+# fall into the all-engines-dead inspection loop below: that loop is for
+# engines that die on their own, and lingering through the stop grace period
+# bills the container the whole time until SIGKILL.
+trap 'log "signal during load; stopping"; cleanup; exit 143' INT TERM
 
 # Engines are started with a stagger. Seven engines each reading a 20 GiB
 # artifact at once thrashes a single volume: the reads interleave, none of them
