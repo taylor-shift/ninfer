@@ -280,9 +280,14 @@ rebuilding.
 vastai search offers 'num_gpus>=8 gpu_name=RTX_5090 cuda_vers>=13.1 rentable=true' -o dph
 vastai create instance <OFFER_ID> --image lroel/ninfer-pod-multi:v6 --disk 50 --ssh --direct \
   --env '-p 8000:8000 -p 8001:8001 -e NINFER_API_KEY=<key> -e NINFER_MODEL=neroued/Qwen3.8-27B-nvfp4-NInfer -e NINFER_ARTIFACT=qwen3_8_27b_nvfp4.ninfer -e NINFER_VOLUME_PATH=/workspace -e NINFER_ARTIFACT_SHA256=bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32 -e HF_TOKEN=<hf> -e NINFER_KV_DTYPE=int8 -e NINFER_KV_CAPACITY=auto -e NINFER_MAX_CONCURRENCY=2 -e NINFER_SPEC=mtp -e NINFER_DRAFT_TOKENS=3 -e NINFER_LM_HEAD_DRAFT=1 -e NINFER_TEXT_CONTEXT=262144 -e NINFER_VISION=1 -e NINFER_VISION_CONTEXT=196608 -e NINFER_ALLOW_ARIA2=0 -e NINFER_DOWNLOAD_CONNECTIONS=16 -e NINFER_PROFILE=auto -e NINFER_START_STAGGER_S=5 -e NINFER_PENDING_TIMEOUT_MS=120000 -e NINFER_PRESERVE_THINKING=1 -e NINFER_ENABLE_SSHD=1 -e PORT=8000' \
-  --onstart-cmd '/usr/local/bin/ninfer-multi-entrypoint'
+  --onstart-cmd 'mkdir -p /workspace && /usr/local/bin/ninfer-multi-entrypoint'
 vastai attach ssh <INSTANCE_ID> "$(cat ~/.ssh/id_ed25519.pub)"
 ```
+
+The `mkdir -p /workspace` prefix matches the template onstart guard and is
+required when the image predates the in-entrypoint mkdir fix (e.g. `v6`);
+images built after that fix carry it in the entrypoint itself, so the guard
+is harmless defense in depth either way.
 
 **Env is load-bearing.** Missing `NINFER_TEXT_CONTEXT`/`NINFER_VISION_CONTEXT`
 makes the entrypoint auto-size context from free KV, and a stale
