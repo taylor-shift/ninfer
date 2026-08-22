@@ -16,10 +16,13 @@
 #           default 48240339)  ($3.75/hr)
 #           host ports + instance disk are STABLE across stop/start; the
 #           onstart entrypoint relaunches engines + balancers automatically.
-#   runpod: 7x5090 pod ee29h260cf8cwh ($6.93/hr)
-#           proxy URL https://<podid>-<port>.proxy.runpod.net is stable across
-#           stop/start (pinned to pod id); container disk is wiped on stop —
-#           the model artifact lives on the attached 30 GB volume.
+#   runpod: 7x5090 pod — DELETED 2026-08-21 (was ee29h260cf8cwh, $6.93/hr).
+#           RUNPOD_POD is empty by default; set RUNPOD_POD=<new-id> to
+#           re-enable — status/up/down/register skip or refuse it cleanly
+#           while unset. Proxy URL https://<podid>-<port>.proxy.runpod.net
+#           is stable across stop/start (pinned to pod id); container disk
+#           is wiped on stop — the model artifact lives on the attached
+#           30 GB volume.
 #   pool:   LiteLLM router (litellm[proxy] venv at /opt/litellm) on the always-
 #           on DSH host. Balances text model "qwen3.8-27b" across
 #           vast + runpod + local and "qwen3.8-27b-vision" across the vision
@@ -41,7 +44,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VAST_STATE_FILE="${VAST_STATE_FILE:-$SCRIPT_DIR/vast-instance-id}"
 VAST_INSTANCE="${VAST_INSTANCE:-$(cat "$VAST_STATE_FILE" 2>/dev/null | tr -d '[:space:]' || true)}"
 [[ -n "$VAST_INSTANCE" ]] || VAST_INSTANCE=48240339
-RUNPOD_POD="${RUNPOD_POD:-ee29h260cf8cwh}"
+# RUNPOD_POD is empty by default: pod ee29h260cf8cwh was deleted 2026-08-21.
+# Set RUNPOD_POD=<id> (env or here) to re-enable the fleet.
+RUNPOD_POD="${RUNPOD_POD:-}"
 RUNPOD_PROXY="https://${RUNPOD_POD}"      # + -<port>.proxy.runpod.net
 DSH_SETTINGS="${DSH_SETTINGS:-/root/.dsh/settings.yaml}"
 CREDENTIALS="${CREDENTIALS:-/root/.dsh/.credentials.yaml}"
@@ -93,8 +98,11 @@ elif [[ -f "$VISION_BASE_FILE" ]]; then
   VAST_VISION_URL="$(cat "$VISION_BASE_FILE")"
 fi
 
-# RunPod endpoint: proxy URL is constant for the life of the pod.
-RP_URL="${RUNPOD_PROXY}-8000.proxy.runpod.net/v1"
+# RunPod endpoint: proxy URL is constant for the life of the pod (empty while no pod).
+RP_URL=""
+if [[ -n "$RUNPOD_POD" ]]; then
+  RP_URL="${RUNPOD_PROXY}-8000.proxy.runpod.net/v1"
+fi
 
 vast_state() {
   vastai show instance "$VAST_INSTANCE" --raw 2>/dev/null | python3 -c '
@@ -186,13 +194,22 @@ PY
 
 cmd_status() {
   local vs rs vc rc lcode
-  vs="$(vast_state)"; rs="$(runpod_state)"
+  vs="$(vast_state)"
+  if [[ -n "$RUNPOD_POD" ]]; then
+    rs="$(runpod_state)"
+  else
+    rs="not configured"
+  fi
   if [[ -n "$VAST_URL" ]]; then
     vc="$(health_code "${VAST_URL%/v1}/health")"
   else
     vc="-"
   fi
-  rc="$(health_code "${RUNPOD_PROXY}-8000.proxy.runpod.net/health")"
+  if [[ -n "$RUNPOD_POD" ]]; then
+    rc="$(health_code "${RUNPOD_PROXY}-8000.proxy.runpod.net/health")"
+  else
+    rc="-"
+  fi
   lcode="$(health_code "$LOCAL_HEALTH")"
   printf '%-15s %-10s %-14s %s\n' "fleet" "state" "health(:8000)" "$/hr"
   printf '%-15s %-10s %-14s %s\n' "vast 8x5090"   "$vs" "${vc:-000}" "$COST_VAST"
@@ -235,14 +252,22 @@ cmd_up() {
   fi
 
   if [[ "$target" == "runpod" || "$target" == "both" ]]; then
-    rs="$(runpod_state)"
-    if [[ "$rs" == "running" ]]; then
-      echo "runpod pod $RUNPOD_POD already running"
+    if [[ -z "$RUNPOD_POD" ]]; then
+      if [[ "$target" == "runpod" ]]; then
+        echo "RunPod pod not configured (ee29h260cf8cwh deleted 2026-08-21) — set RUNPOD_POD=<id> first" >&2
+        return 1
+      fi
+      echo "skipping runpod (not configured — pod deleted 2026-08-21; set RUNPOD_POD to re-enable)"
     else
-      echo "starting runpod pod $RUNPOD_POD (was: $rs)..."
-      runpodctl pods start "$RUNPOD_POD"
+      rs="$(runpod_state)"
+      if [[ "$rs" == "running" ]]; then
+        echo "runpod pod $RUNPOD_POD already running"
+      else
+        echo "starting runpod pod $RUNPOD_POD (was: $rs)..."
+        runpodctl pods start "$RUNPOD_POD"
+      fi
+      checks+=(runpod "$RP_URL")
     fi
-    checks+=(runpod "$RP_URL")
   fi
 
   # Wait for health; a warm fleet fast-paths the first probe.
@@ -266,7 +291,7 @@ cmd_up() {
       sleep 2; cmd_pool start
     fi
   fi
-  if [[ "$target" == "runpod" || "$target" == "both" ]]; then
+  if [[ -n "$RUNPOD_POD" && ( "$target" == "runpod" || "$target" == "both" ) ]]; then
     if grep -q 'ninfer-7x5090:' "$DSH_SETTINGS" 2>/dev/null; then
       rewrite_baseurl ninfer-7x5090 "$RP_URL"
     else
@@ -294,12 +319,20 @@ cmd_down() {
   fi
 
   if [[ "$target" == "runpod" || "$target" == "both" ]]; then
-    rs="$(runpod_state)"
-    if [[ "$rs" == "running" ]]; then
-      echo "stopping runpod pod $RUNPOD_POD..."
-      runpodctl pods stop "$RUNPOD_POD"
+    if [[ -z "$RUNPOD_POD" ]]; then
+      if [[ "$target" == "runpod" ]]; then
+        echo "RunPod pod not configured (ee29h260cf8cwh deleted 2026-08-21) — set RUNPOD_POD=<id> first" >&2
+        return 1
+      fi
+      echo "skipping runpod (not configured)"
     else
-      echo "runpod pod $RUNPOD_POD already stopped ($rs)"
+      rs="$(runpod_state)"
+      if [[ "$rs" == "running" ]]; then
+        echo "stopping runpod pod $RUNPOD_POD..."
+        runpodctl pods stop "$RUNPOD_POD"
+      else
+        echo "runpod pod $RUNPOD_POD already stopped ($rs)"
+      fi
     fi
   fi
   echo "fleet down. GPU billing stopped (runpod 30GB volume still bills ~\$0.44/mo)."
@@ -311,6 +344,10 @@ cmd_register() {
   if grep -q 'ninfer-7x5090:' "$DSH_SETTINGS" 2>/dev/null; then
     echo "ninfer-7x5090 provider already present in $DSH_SETTINGS"
     return 0
+  fi
+  if [[ -z "$RUNPOD_POD" ]]; then
+    echo "RunPod pod not configured (ee29h260cf8cwh deleted 2026-08-21) — set RUNPOD_POD=<id> before registering" >&2
+    return 1
   fi
   python3 - "$DSH_SETTINGS" "$RP_URL" "$RUNPOD_POD" <<'PY'
 import sys

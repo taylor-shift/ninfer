@@ -109,9 +109,10 @@ time; the commented provider block in `settings.yaml` is ready for it.
 
 ## Fleet control (fleet.sh)
 
-The Vast fleet and the RunPod 7×5090 fleet (`ee29h260cf8cwh`, $6.93/hr,
-`lroel/ninfer-pod-multi:v6`) are started/stopped as a unit by
-`fleet.sh` in this directory:
+The Vast fleet and the RunPod 7×5090 fleet are started/stopped as a unit by
+`fleet.sh` in this directory. The RunPod pod `ee29h260cf8cwh` was **DELETED
+2026-08-21**, so `RUNPOD_POD` is empty by default and the RunPod side is
+skipped (set `RUNPOD_POD=<new-id>` to re-enable):
 
 ```bash
 ./fleet.sh status            # state + /health + $/hr for both fleets + local
@@ -130,8 +131,10 @@ The Vast fleet and the RunPod 7×5090 fleet (`ee29h260cf8cwh`, $6.93/hr,
   the `.ninfer` artifact is cached on the 30 GB volume after the first start
   (first cold start downloads ~20.5 GiB from HF and can exceed the 10-min
   health budget — just rerun `fleet.sh up runpod`). The proxy URL
-  `https://ee29h260cf8cwh-{8000,8001}.proxy.runpod.net` is pinned to the pod
-  id and stable across stop/start.
+  `https://<podid>-{8000,8001}.proxy.runpod.net` is pinned to the pod id and
+  stable across stop/start. (Pod `ee29h260cf8cwh` was deleted 2026-08-21;
+  a replacement pod needs a new `RUNPOD_POD`, `litellm-config.yaml` blocks,
+  and `pool-balancer.json` entry.)
 - `up` rewrites the `baseURL` of `ninfer-8x5090` (via
   `refresh-dsh-endpoint.sh`) and `ninfer-7x5090` in `~/.dsh/settings.yaml`
   (line-oriented, comments survive), and writes

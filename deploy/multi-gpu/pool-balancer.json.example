@@ -9,6 +9,7 @@
   "health_timeout_sec": 5,
   "_master_key_note": "REQUIRED for model traffic: same value clients send to the LiteLLM master_key layer. Requests present it via Authorization: Bearer or x-api-key. Without it, all model traffic is refused (401, fail-closed); /health stays open.",
   "master_key": "POOL_MASTER_KEY",
+  "_runpod_note": "runpod-7x5090 entries below are placeholders: pod ee29h260cf8cwh was deleted 2026-08-21 — remove those entries from the REAL config while no pod exists (a dead entry 404s per request and is only skipped by the health probe after its first failure). Restore with a new pod's proxy URLs.",
   "pools": {
     "text": [
       {

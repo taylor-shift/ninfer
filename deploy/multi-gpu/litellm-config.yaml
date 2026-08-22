@@ -47,13 +47,18 @@ model_list:
       api_key: os.environ/NINFER_VAST_API_KEY
     litellm_model_name: vast-8x5090
 
-  - model_name: qwen3.8-27b
-    max_parallel_requests: 10    # runpod: 5 text engines x C=2
-    litellm_params:
-      model: openai/qwen3.8-27b
-      api_base: https://ee29h260cf8cwh-8000.proxy.runpod.net/v1
-      api_key: os.environ/NINFER_RUNPOD_API_KEY
-    litellm_model_name: runpod-7x5090
+  # runpod-7x5090 REMOVED 2026-08-21: pod ee29h260cf8cwh was DELETED (account
+  # pod list empty) — proxy.runpod.net 404s are classified non-retryable, so
+  # a dead deployment in rotation 404s real client traffic once per cooldown
+  # window. Restore this block when a 7x5090 pod exists again (new pod id =
+  # new proxy URLs).
+  #  - model_name: qwen3.8-27b
+  #    max_parallel_requests: 10    # runpod: 5 text engines x C=2
+  #    litellm_params:
+  #      model: openai/qwen3.8-27b
+  #      api_base: https://ee29h260cf8cwh-8000.proxy.runpod.net/v1
+  #      api_key: os.environ/NINFER_RUNPOD_API_KEY
+  #    litellm_model_name: runpod-7x5090
 
   - model_name: qwen3.8-27b
     max_parallel_requests: 2     # local: 1 engine x C=2 (shares the card with
@@ -65,13 +70,14 @@ model_list:
     litellm_model_name: local-5090
 
   # ---- vision pool ----------------------------------------------------
-  - model_name: qwen3.8-27b-vision
-    max_parallel_requests: 4     # runpod: 2 vision engines x C=2
-    litellm_params:
-      model: openai/qwen3.8-27b
-      api_base: https://ee29h260cf8cwh-8001.proxy.runpod.net/v1
-      api_key: os.environ/NINFER_RUNPOD_API_KEY
-    litellm_model_name: runpod-7x5090-vision
+  # runpod-7x5090-vision REMOVED 2026-08-21 (pod deleted — see note above).
+  #  - model_name: qwen3.8-27b-vision
+  #    max_parallel_requests: 4     # runpod: 2 vision engines x C=2
+  #    litellm_params:
+  #      model: openai/qwen3.8-27b
+  #      api_base: https://ee29h260cf8cwh-8001.proxy.runpod.net/v1
+  #      api_key: os.environ/NINFER_RUNPOD_API_KEY
+  #    litellm_model_name: runpod-7x5090-vision
 
   # Vast vision: the canonical template (584160) publishes :8001. fleet.sh
   # injects the base from the live mapping (persisting the last-known value in
