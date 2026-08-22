@@ -287,6 +287,11 @@ cmd_up() {
   while (( i < ${#checks[@]} )); do
     if [[ -n "${checks[i+1]}" ]]; then
       wait_health "${checks[i]}" "${checks[i+1]}"
+    else
+      # An empty URL means the host port mapping was not (yet) available when
+      # we started: the fleet is not healthy and we are about to report success
+      # anyway. Say so, instead of silently skipping the wait.
+      echo "WARNING: ${checks[i]} has no URL (host port not mapped yet) — skipping its health wait; check 'fleet.sh status' in a few minutes" >&2
     fi
     i=$(( i + 2 ))
   done
