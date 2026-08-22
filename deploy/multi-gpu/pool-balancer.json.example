@@ -7,6 +7,8 @@
   },
   "health_interval_sec": 15,
   "health_timeout_sec": 5,
+  "_master_key_note": "REQUIRED for model traffic: same value clients send to the LiteLLM master_key layer. Requests present it via Authorization: Bearer or x-api-key. Without it, all model traffic is refused (401, fail-closed); /health stays open.",
+  "master_key": "POOL_MASTER_KEY",
   "pools": {
     "text": [
       {

@@ -28,9 +28,14 @@ locally with the health map (does not consume upstream capacity).
 
 Config: POOL_BALANCER_CONFIG env, else pool-balancer.json next to this script
 (chmod 600; carries the per-fleet keys — never commit it; see
-pool-balancer.json.example).
+pool-balancer.json.example). `master_key` in the config is required for
+model traffic: every non-/health request must present it via
+`Authorization: Bearer <key>` or `x-api-key: <key>` (constant-time
+comparison). Without it the pool answers 401 to all model traffic
+(fail-closed).
 """
 
+import hmac
 import json
 import os
 import socket
@@ -92,7 +97,16 @@ def health_loop(u, interval, timeout, stop):
 
 
 def rewrite_head(head, u, tag):
-    """Rewrite Host/Authorization; append X-Pool-Upstream INSIDE the head.
+    """Rewrite Host and the client credential; append X-Pool-Upstream INSIDE
+    the head.
+
+    The client's credential — whatever form it arrived in (`Authorization:
+    Bearer` or `x-api-key`) — is replaced by the fleet's own key as
+    `Authorization: Bearer <key>`. The upstreams carry DIFFERENT keys, and the
+    client's master key must never leak to them; a client that presented the
+    master key via x-api-key would otherwise hit a 401 upstream (or, if the
+    keys happened to match, authenticate with the master key by accident).
+    Duplicate credential headers are dropped (first one wins).
 
     `head` ends with the single \r\n\r\n terminator. The tag must be a real
     header line BEFORE that terminator — appending it after would make the
@@ -101,6 +115,7 @@ def rewrite_head(head, u, tag):
     body = head[:-2] if head.endswith(b"\r\n\r\n") else head
     lines = body.split(b"\r\n")
     out = []
+    auth_done = False
     for i, line in enumerate(lines):
         if i == 0:
             out.append(line)
@@ -108,10 +123,15 @@ def rewrite_head(head, u, tag):
         name = line.split(b":", 1)[0].strip().lower()
         if name == b"host":
             out.append(f"Host: {u.host_header()}".encode())
-        elif name == b"authorization":
-            out.append(f"Authorization: Bearer {u.key}".encode())
+        elif name in (b"authorization", b"x-api-key"):
+            if not auth_done:
+                out.append(f"Authorization: Bearer {u.key}".encode())
+                auth_done = True
+            # else: drop the duplicate credential header
         else:
             out.append(line)
+    if not auth_done:
+        out.append(f"Authorization: Bearer {u.key}".encode())
     out.append(f"X-Pool-Upstream: {tag}".encode())
     return b"\r\n".join(out) + b"\r\n\r\n"
 
@@ -151,6 +171,24 @@ def read_head(sock):
     return buf[:i], buf[i:]
 
 
+def client_key(head):
+    """Extract the client's key from `Authorization: Bearer <key>` or
+    `x-api-key: <key>` (ninfer-serve accepts either form). `head` is the
+    request line plus headers, ending in \\r\\n\\r\\n. Returns key bytes or None.
+    """
+    for line in head.split(b"\r\n")[1:]:
+        name, sep, value = line.partition(b":")
+        if not sep:
+            continue
+        name = name.strip().lower()
+        value = value.strip()
+        if name == b"authorization":
+            return value[7:].strip() if value.lower().startswith(b"bearer ") else None
+        if name == b"x-api-key":
+            return value
+    return None
+
+
 def handle(conn, addr, pool, cfg):
     client = conn
     try:
@@ -161,7 +199,8 @@ def handle(conn, addr, pool, cfg):
         parts = first.split()
         method, path = parts[0] if parts else "", (parts[1] if len(parts) > 1 else "")
 
-        # Local health endpoint: answer without touching upstreams.
+        # Local health endpoint: answer without touching upstreams (and
+        # without requiring the master key — operator visibility only).
         if method == "GET" and path == "/health":
             with pool["lock"]:
                 ups = {u.name: {"up": u.up, "in_flight": u.in_flight} for u in pool["ups"]}
@@ -169,6 +208,19 @@ def handle(conn, addr, pool, cfg):
             resp = (f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                     f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n").encode() + payload
             client.sendall(resp)
+            return
+
+        # Client auth: this proxy is the zero-dependency fallback for the
+        # LiteLLM master-key layer, so it must require the SAME master key
+        # before granting fleet access (anyone who can reach the host could
+        # otherwise get authenticated GPU time for free). Both header forms
+        # the engines accept are accepted; comparison is constant-time.
+        master = pool["master_key"]
+        presented = client_key(head)
+        if not master or not presented or not hmac.compare_digest(presented, master):
+            payload = json.dumps({"error": "invalid or missing master key"}).encode()
+            client.sendall((f"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n"
+                            f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n").encode() + payload)
             return
 
         with pool["lock"]:
@@ -240,7 +292,8 @@ def handle(conn, addr, pool, cfg):
 
 def make_pool(name, specs, cfg, stop):
     ups = [Upstream(s) for s in specs]
-    pool = {"name": name, "ups": ups, "lock": threading.Lock()}
+    pool = {"name": name, "ups": ups, "lock": threading.Lock(),
+            "master_key": (cfg.get("master_key") or "").encode()}
     for u in ups:
         threading.Thread(target=health_loop, args=(u, cfg["health_interval_sec"],
                                                    cfg["health_timeout_sec"], stop),
@@ -265,6 +318,10 @@ def serve(listen_port, pool, cfg, stop):
 
 
 cfg = json.load(open(CONFIG))
+if not cfg.get("master_key"):
+    log("WARNING: no master_key in config — all model traffic will be REFUSED (401). "
+        "Set \"master_key\" to the same value clients send to the LiteLLM layer to "
+        "restore traffic; /health stays open.")
 stop = threading.Event()
 
 pools = {
