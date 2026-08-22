@@ -20,6 +20,12 @@
 #   NINFER_POOL_VAST_VISION_BASE  (same, for :8001; enables the Vast vision
 #                            deployment when set)
 #
+# Environment references use the os.environ/ form ONLY. The installed litellm
+# build does NOT expand bare ${VAR} in litellm_params — verified 2026-08-21 on
+# the live pool: the literal string "${NINFER_POOL_VAST_BASE}" reached the
+# /health probe, so the Vast deployment was dead on arrival. api_base and
+# api_key must both use os.environ/NAME.
+#
 # Run: litellm --config litellm-config.yaml --port 8800 --host 0.0.0.0
 #
 # Clients:
@@ -37,7 +43,7 @@ model_list:
     max_parallel_requests: 12    # vast: 6 text engines x C=2
     litellm_params:
       model: openai/qwen3.8-27b
-      api_base: ${NINFER_POOL_VAST_BASE}
+      api_base: os.environ/NINFER_POOL_VAST_BASE
       api_key: os.environ/NINFER_VAST_API_KEY
     litellm_model_name: vast-8x5090
 
@@ -75,7 +81,7 @@ model_list:
     max_parallel_requests: 4     # vast: 2 vision engines x C=2
     litellm_params:
       model: openai/qwen3.8-27b
-      api_base: ${NINFER_POOL_VAST_VISION_BASE}
+      api_base: os.environ/NINFER_POOL_VAST_VISION_BASE
       api_key: os.environ/NINFER_VAST_API_KEY
     litellm_model_name: vast-8x5090-vision
 
