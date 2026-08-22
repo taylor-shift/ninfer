@@ -67,15 +67,23 @@ graph families).
   replicas are ready.
 - Ctrl-C / SIGTERM tears down the balancer and every engine.
 - A replica that refuses a connection returns **502** to that caller; the others
-  keep serving.
+  keep serving. After 3 consecutive refused sessions the port is excluded from
+  selection for 30 s (a dead card otherwise looks "least busy" and attracts a
+  disproportionate share of the 502s); a clean session resets the streak, and if
+  every port is cooling down traffic goes to the full set — a 502 beats a
+  dropped connection.
 
 ## Load balancer design
 
 `balancer.pl` is a forking **TCP** relay, not an HTTP proxy — it never parses or
 buffers the payload, so SSE streaming, chunked encoding, keep-alive, and both the
 OpenAI and Anthropic surfaces pass through untouched. Each accepted connection is
-routed to the replica with the fewest live sessions (ties → lower port), the
-parent tracks session counts and decrements on `SIGCHLD`.
+routed to the replica with the fewest live sessions (ties → lower port); the
+parent tracks session counts, and every child blocks on a one-shot pipe until the
+parent has recorded the session, so a fast-exiting child (upstream refused → 502
+in microseconds) can never outrun the bookkeeping — every increment has a
+matching decrement, and a recovered engine is never left permanently
+over-counted.
 
 Round-robin was rejected deliberately: request lifetimes vary by orders of
 magnitude here, so blind rotation buries one card while another idles.
