@@ -18,6 +18,23 @@ set -euo pipefail
 log() { printf '[ninfer-entrypoint] %s\n' "$*" >&2; }
 fail() { log "ERROR: $*"; exit 1; }
 
+# Log the engine argv with the --api-key value redacted. The platform captures
+# worker stderr into persistent, fetchable logs, so the engine key must never
+# appear there; a length and fingerprint (same convention as the multi-GPU
+# entrypoint) are enough to confirm which key came up.
+log_exec() {
+    local redacted=() a prev=""
+    for a in "$@"; do
+        if [[ "$prev" == "--api-key" ]]; then
+            redacted+=("<redacted>")
+        else
+            redacted+=("$a")
+        fi
+        prev="$a"
+    done
+    log "exec: ${redacted[*]}"
+}
+
 HF_CACHE_ROOT="${HF_CACHE_ROOT:-/runpod-volume/huggingface-cache/hub}"
 
 # --- 0. Answer health probes immediately ------------------------------------
@@ -270,6 +287,14 @@ fi
 # engine can be consumed before it arrives; ninfer-serve accepts either form.
 if [[ -n "${NINFER_API_KEY:-}" ]]; then
     args+=(--api-key "$NINFER_API_KEY")
+    # Never log the key itself; a length and fingerprint are enough to confirm
+    # which key the engine came up with (the exec lines redact it).
+    key_len=${#NINFER_API_KEY}
+    if command -v sha256sum >/dev/null 2>&1; then
+        log "auth: enabled (key ${key_len} chars, sha256:$(printf '%s' "$NINFER_API_KEY" | sha256sum | cut -c1-8))"
+    else
+        log "auth: enabled (key ${key_len} chars)"
+    fi
 elif [[ "${NINFER_ALLOW_ANONYMOUS:-0}" == "1" ]]; then
     log "WARNING: NINFER_ALLOW_ANONYMOUS=1 — serving without an API key"
 else
@@ -287,7 +312,7 @@ if [[ "$health_port" == "$port" ]]; then
     # The gate from section 0 already holds this port and is answering 204. Start
     # the engine on its internal port; the gate releases the port as soon as the
     # engine's own /health returns 200.
-    log "exec: ${args[*]}"
+    log_exec "${args[@]}"
     "${args[@]}" &
     engine_pid=$!
 
@@ -318,5 +343,5 @@ if [[ "$health_port" == "$port" ]]; then
     ' "$port" "$engine_port"
 fi
 
-log "exec: ${args[*]}"
+log_exec "${args[@]}"
 exec "${args[@]}"
