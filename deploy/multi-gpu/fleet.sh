@@ -594,12 +594,13 @@ print(",".join(str(i.get("id")) for i in insts
   # 3. Wait for host ports + /health (artifact pull ~4 min with HF_TOKEN;
   #    8 engines ~2-3 min more). Ports are allocated a minute or two after start.
   waited=0
+  saw_200=0
   VAST_URL=""; VAST_VISION_URL=""
   while (( waited < VAST_NEW_WAIT )); do
     read -r ip p8000 p8001 < <(vast_mapping) || true
     if [[ -n "$ip" && "$ip" != "-" && -n "$p8000" ]]; then
       code="$(health_code "http://${ip}:${p8000}/health")"
-      if [[ "$code" == "200" ]]; then break; fi
+      if [[ "$code" == "200" ]]; then saw_200=1; break; fi
     fi
     waited=$((waited + 20))
     echo "  waiting for $id (ip=${ip:-...} :8000=${p8000:-...}) ${waited}/${VAST_NEW_WAIT}s"
@@ -608,6 +609,20 @@ print(",".join(str(i.get("id")) for i in insts
   read -r ip p8000 p8001 < <(vast_mapping) || true
   if [[ -z "${ip:-}" || "$ip" == "-" || -z "${p8000:-}" ]]; then
     echo "timed out waiting for $id — diagnose: vastai logs $id" >&2
+    return 1
+  fi
+  if [[ "$saw_200" != "1" ]]; then
+    # Vast allocates host port mappings while the container app is still dead,
+    # so port-up-but-health-dead after the full budget is a hung engine, not
+    # "still starting" (a pull+load fits the budget ~4x over). Same policy as
+    # the disk downgrade above: a doomed (billed) instance is destroyed, not
+    # left running, and the pool is not repointed at a dead URL.
+    echo "instance $id has its port up but never served /health within ${VAST_NEW_WAIT}s — engine hung; destroying" >&2
+    echo "  --- tail of instance logs (before destroy) ---" >&2
+    vastai logs "$id" --tail 40 2>/dev/null >&2 || true
+    vastai destroy instance "$id" --yes >/dev/null 2>&1 || true
+    rm -f "$VAST_STATE_FILE"
+    echo "re-run: fleet.sh vast new" >&2
     return 1
   fi
   VAST_URL="http://${ip}:${p8000}/v1"
