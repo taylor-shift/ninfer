@@ -93,7 +93,9 @@ VAST_VISION_URL=""
 # after one failure (cooldown 30s).
 VISION_BASE_FILE="$SCRIPT_DIR/vast-vision-base"
 if [[ -n "$VAST_VISION_URL" ]]; then
-  echo "$VAST_VISION_URL" > "$VISION_BASE_FILE"
+  # Atomic: the pool proxy reads this file at startup; a truncated mid-write
+  # file would look like an empty (fresh) base.
+  echo "$VAST_VISION_URL" > "${VISION_BASE_FILE}.tmp" && mv -f "${VISION_BASE_FILE}.tmp" "$VISION_BASE_FILE"
 elif [[ -f "$VISION_BASE_FILE" ]]; then
   VAST_VISION_URL="$(cat "$VISION_BASE_FILE")"
 fi
@@ -146,7 +148,7 @@ wait_health() {
 rewrite_baseurl() {
   local provider=$1 url=$2
   python3 - "$DSH_SETTINGS" "$provider" "$url" <<'PY'
-import re, sys
+import os, re, sys
 path, provider, url = sys.argv[1:4]
 src = open(path).read()
 lines = src.splitlines(keepends=True)
@@ -163,7 +165,12 @@ for line in lines:
     out.append(line)
 if not done:
     sys.exit(f'provider {provider} or its baseURL not found in {path}')
-open(path, 'w').write(''.join(out))
+# Atomic: DSH re-reads this file; truncate-then-write would briefly expose an
+# empty settings file.
+tmp = path + '.tmp'
+with open(tmp, 'w') as f:
+    f.write(''.join(out))
+os.replace(tmp, path)
 print(f'updated {path}: {provider}.baseURL = {url}')
 PY
 }
@@ -172,7 +179,7 @@ write_endpoints() {
   local ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   python3 - "$ENDPOINTS_FILE" "$VAST_URL" "$VAST_VISION_URL" "$RP_URL" "$ts" <<'PY'
-import json, sys
+import json, os, sys
 path, vast_text, vast_vision, rp_text, ts = sys.argv[1:6]
 doc = {
     "updated_at": ts,
@@ -185,7 +192,12 @@ doc = {
         "local_5090":           {"url": "http://192.168.8.15:8000/v1", "contextWindow": 262144},
     },
 }
-json.dump(doc, open(path, "w"), indent=2)
+# Atomic: orchestrator discovery reads this file; a half-written JSON would
+# parse-error.
+tmp = path + '.tmp'
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+os.replace(tmp, path)
 print(f"wrote {path}")
 PY
 }
@@ -350,7 +362,7 @@ cmd_register() {
     return 1
   fi
   python3 - "$DSH_SETTINGS" "$RP_URL" "$RUNPOD_POD" <<'PY'
-import sys
+import os, sys
 path, url, pod = sys.argv[1:4]
 src = open(path).read()
 anchor = '    ninfer-8x5090:'
@@ -376,7 +388,12 @@ block = f'''    # RunPod 7x5090 ninfer split fleet (pod {pod}, $6.93/hr). Proxy 
 
 '''
 src = src.replace(anchor, block + anchor, 1)
-open(path, 'w').write(src)
+# Atomic: DSH re-reads this file; a truncated mid-write file would lose
+# every provider for the duration of the write.
+tmp = path + '.tmp'
+with open(tmp, 'w') as f:
+    f.write(src)
+os.replace(tmp, path)
 print(f'added ninfer-7x5090 provider to {path}')
 PY
   rewrite_baseurl ninfer-7x5090 "$RP_URL"
@@ -626,7 +643,8 @@ print(",".join(str(i.get("id")) for i in insts
   img="$(echo "$specout" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("image_name") or d.get("image_uuid") or "")' 2>/dev/null || true)"
   [[ "$img" == *":v6"* || -z "$img" ]] || echo "warning: instance $id has image '$img' (expected v6)" >&2
   vastai attach ssh "$id" "$(cat ~/.ssh/id_ed25519.pub)" >/dev/null 2>&1 || true
-  echo "$id" > "$VAST_STATE_FILE"
+  # Atomic: the next fleet.sh run reads this as the live instance id.
+  printf '%s\n' "$id" > "${VAST_STATE_FILE}.tmp" && mv -f "${VAST_STATE_FILE}.tmp" "$VAST_STATE_FILE"
   VAST_INSTANCE="$id"
   # 3. Wait for host ports + /health (artifact pull ~4 min with HF_TOKEN;
   #    8 engines ~2-3 min more). Ports are allocated a minute or two after start.
