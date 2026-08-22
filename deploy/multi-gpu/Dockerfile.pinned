@@ -87,7 +87,7 @@ RUN mkdir -p /var/run/sshd /root/.ssh /var/log/ninfer \
     && sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
-COPY entrypoint-multi.sh /usr/local/bin/ninfer-multi-entrypoint
+COPY entrypoint.sh /usr/local/bin/ninfer-multi-entrypoint
 COPY balancer.pl        /usr/local/bin/ninfer-balancer
 COPY fetch-artifact.sh  /usr/local/bin/ninfer-fetch-artifact
 

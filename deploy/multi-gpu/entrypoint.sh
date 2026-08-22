@@ -114,6 +114,12 @@ if [[ -z "$artifact" ]]; then
     # uses hf_transfer or aria2c over many connections instead.
     if [[ -z "$artifact" ]]; then
         target_dir="${NINFER_VOLUME_PATH:-/models}"
+        # Vast hosts do not create the volume path (plain dir on the container
+        # disk); RunPod mounts it as a network volume. Without this the
+        # artifact download fails silently and the entrypoint hangs in do_wait
+        # (seen 2026-08-21 on Vast: /workspace absent, fetcher died, no log,
+        # no file, instance billed for nothing).
+        mkdir -p "$target_dir"
         target="${target_dir}/${NINFER_ARTIFACT:-$(basename "$model").ninfer}"
         # NINFER_NO_DOWNLOAD=1 makes a missing artifact a hard stop instead of a
         # download. Retrying a fetch in a supervised container fights any manual
