@@ -8,6 +8,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -485,19 +486,46 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                                                        width, batch),
                                      ops::bidirectional_gqa_attention_workspace_capacity_bytes(
                                          {0, plan.capacity}, width, width, batch)));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::query_size, tokens, tokens));
+                    // The v1 drafter fuses GEMM+residual (linear_add); DFlash 2 inserts the
+                    // grouped dynamic conv between the GEMM and the residual add, so its
+                    // attention-output GEMM is a plain linear. The W8 linear_add plan is tuned
+                    // to the v1 {2048, 4096/6144} domain and never sees the DFlash 2 shapes.
+                    if constexpr (DFlashConfig::conv_kernel_size == 0) {
+                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::query_size, tokens, tokens));
+                    } else {
+                        scratch(layout, ops::linear_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::query_size, LinearPolicy::A16Only,
+                                            tokens, tokens));
+                    }
                 }
                 {
                     auto mlp = layout.scope();
                     (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
-                    scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                        DFlashConfig::hidden, tokens, tokens));
-                    scratch(layout, ops::linear_add_workspace_capacity_bytes(
-                                        QType::W8G32_F16S, DFlashConfig::hidden,
-                                        DFlashConfig::intermediate, tokens, tokens));
+                    if constexpr (DFlashConfig::conv_kernel_size == 0) {
+                        // v1: fused W8 swiglu + fused linear_add down (the plans' tuned domain).
+                        scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
+                                            DFlashConfig::hidden, tokens, tokens));
+                        scratch(layout, ops::linear_add_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::intermediate, tokens, tokens));
+                    } else {
+                        // DFlash 2: unfused W8 linear gate_up (the fused W8 swiglu plan is tuned
+                        // to the v1 {12288,6144,2048} domain) with the silu_mul epilogue (the
+                        // mtp_post_mixer pattern; silu_mul needs no scratch), and the unfused
+                        // linear down around the second grouped dynamic conv.
+                        scratch(layout, ops::linear_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
+                                            DFlashConfig::hidden, LinearPolicy::A16Only,
+                                            tokens, tokens));
+                        scratch(layout, ops::linear_workspace_capacity_bytes(
+                                            QType::W8G32_F16S, DFlashConfig::hidden,
+                                            DFlashConfig::intermediate, LinearPolicy::A16Only,
+                                            tokens, tokens));
+                    }
                 }
                 // DFlash 2 propose-path roots (grouped dynamic convs + path selector) are gated by
                 // the Config fields the v1 drafter leaves at zero, so this is a no-op for them.

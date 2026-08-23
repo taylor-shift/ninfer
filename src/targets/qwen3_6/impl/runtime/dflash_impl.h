@@ -19,6 +19,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/swa.h"
@@ -336,8 +337,21 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                         weight.mlp_conv.base_kernel, mlp_input, 0, batch_size,
                         state.execution.device.stream);
                 }
-                ops::linear_swiglu(mlp_input, weight.gate_up, roots.intermediate,
-                                   state.execution.work, state.execution.device.stream);
+                if constexpr (Config::conv_kernel_size > 0) {
+                    // DFlash 2: the fused W8 swiglu plan is tuned to the v1 35B shape
+                    // {12288,6144,2048}; the 27B gate_up {34816,5120} runs unfused (W8 linear +
+                    // silu_mul, the mtp_post_mixer pattern).
+                    Tensor gate_up_out = state.execution.work.alloc(
+                        DType::BF16, {2 * Config::intermediate, columns});
+                    ops::linear(mlp_input, weight.gate_up, gate_up_out,
+                                state.execution.device.stream);
+                    ops::silu_mul(gate_up_out.slice(0, 0, Config::intermediate),
+                                  gate_up_out.slice(0, Config::intermediate, Config::intermediate),
+                                  roots.intermediate, state.execution.device.stream);
+                } else {
+                    ops::linear_swiglu(mlp_input, weight.gate_up, roots.intermediate,
+                                       state.execution.work, state.execution.device.stream);
+                }
                 if constexpr (Config::conv_kernel_size > 0) {
                     // DFlash 2: mlp_o = linear(inter, down); fin2 = grouped_dynamic_causal_conv(
                     // mlp_o, dyn2.use1, mlp base.use1) into the shared conv-out buffer;
