@@ -307,6 +307,7 @@ sanitize_test() { # $1=binary name $2=timeout-seconds [$3...=extra docker run fl
   fi
   warn "auto-diagnosing $name under compute-sanitizer (timeout ${secs}s) ..."
   timeout "$secs" docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
+    -e NINFER_LOG_OPS=1 \
     "$@" \
     "$(test_image)" \
     bash -c "cd /build && /usr/local/cuda/bin/compute-sanitizer --tool memorycheck --show-backtrace 1 --print-limit 30 ./tests/$name" \
@@ -318,6 +319,7 @@ run_op_tests() {
   FAILED_OPS=""
   if [ "$GPU_MODE" = docker ]; then
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
+      -e NINFER_LOG_OPS=1 \
       "$(test_image)" bash -c "cd /build && ctest -R '^(${CONV_TEST}|${SEL_TEST})\$' --output-on-failure" \
       > /tmp/dflash2-opdocker.log 2>&1
     local rc=$?
@@ -327,10 +329,10 @@ run_op_tests() {
   else
     extract_missing_libs "$BUILD/tests/$CONV_TEST" "$BUILD/tests/$SEL_TEST"
     info "running $CONV_TEST (native) ..."
-    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./"$CONV_TEST" ) \
+    ( cd "$BUILD/tests" && NINFER_LOG_OPS=1 LD_LIBRARY_PATH="$CUDA13LIBS" ./"$CONV_TEST" ) \
       > /tmp/dflash2-opconv.log 2>&1; rc1=$?
     info "running $SEL_TEST (native) ..."
-    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./"$SEL_TEST" ) \
+    ( cd "$BUILD/tests" && NINFER_LOG_OPS=1 LD_LIBRARY_PATH="$CUDA13LIBS" ./"$SEL_TEST" ) \
       > /tmp/dflash2-opselector.log 2>&1; rc2=$?
     tail -3 /tmp/dflash2-opconv.log; tail -3 /tmp/dflash2-opselector.log
     [ "$rc1" -ne 0 ] && FAILED_OPS="$FAILED_OPS $CONV_TEST"
@@ -363,6 +365,7 @@ run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
       -v "$(dirname "$ARTIFACT"):/artifacts" \
       -e "NINFER_QWEN3_8_27B_WEIGHTS=/artifacts/$(basename "$ARTIFACT")" \
+      -e NINFER_LOG_OPS=1 \
       "$(test_image)" bash -c "cd /build && ctest -R '$pat' --output-on-failure"
     return $?
   fi
@@ -374,7 +377,7 @@ run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
   if [ ! -x "$out" ]; then warn "binary for '$pat' not found under $BUILD"; return 1; fi
   extract_missing_libs "$out"
   info "running $bin (native, artifact: $ARTIFACT) ..."
-  ( cd "$(dirname "$out")" && env "$ART_ENV" LD_LIBRARY_PATH="$CUDA13LIBS" "./$(basename "$out")" )
+  ( cd "$(dirname "$out")" && env "$ART_ENV" NINFER_LOG_OPS=1 LD_LIBRARY_PATH="$CUDA13LIBS" "./$(basename "$out")" )
 }
 # 4a: load-plan (CPU-side binder; the dflash plan half needs the augmented
 #     artifact)
