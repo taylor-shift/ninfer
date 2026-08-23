@@ -21,6 +21,8 @@ from tools.convert.qwen3_6.common.inventory import (
     build_vision_specs,
 )
 
+from . import dflash2
+
 
 MODEL_ID = "qwen3.8-27b"
 WEIGHTS_ID = "nvfp4"
@@ -188,6 +190,17 @@ TENSOR_SPECS = (
     + VISION_TENSOR_SPECS
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
+
+# DFlash 2 drafter section (additive, optional).  The 66 ``dflash/*`` specs
+# have their single home in dflash2.py (validated object-by-object against
+# src/targets/qwen3_6_27b/impl/load/bindings.cpp).  As with the 35B
+# DFLASH_TENSOR_SPECS group, the section is deliberately NOT part of
+# TENSOR_SPECS/OBJECT_SPECS or the format/layout totals: the registered
+# no-flag plan and its artifact stay byte-for-byte reproducible, and the
+# dflash objects enter the object plan only when the converter runs with
+# --dflash-model (see convert_nvfp4.build_object_plan).
+DFLASH2_LAYERS = dflash2.DFLASH2_LAYERS
+DFLASH2_TENSOR_SPECS = dflash2.DFLASH2_TENSOR_SPECS
 
 FORMAT_COUNTS = {
     numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)
@@ -418,6 +431,8 @@ __all__ = [
     "BF16",
     "BLOCK_SCALE_LAYOUT",
     "CONTIGUOUS_LAYOUT",
+    "DFLASH2_LAYERS",
+    "DFLASH2_TENSOR_SPECS",
     "DRAFT_HEAD_TENSOR_SPECS",
     "FORMAT_COUNTS",
     "FORMAT_NAMES",

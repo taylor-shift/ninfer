@@ -6,6 +6,19 @@ Canonical invocation::
       --model /path/to/Qwen3.8-27B/base-hf-bf16 \
       --quantized-model /path/to/Qwen3.8-27B/vllm-nvfp4-fp8 \
       --out out/qwen3_8_27b_nvfp4.ninfer
+
+Optional DFlash 2 drafter section: with ``--dflash-model`` pointing at a
+directory holding the DFlash 2 draft checkpoint (``config.json`` +
+``model.safetensors``), the 66-object ``dflash/*`` section is validated in
+the preflight phase and appended after the registered objects::
+
+    python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
+      --model /path/to/Qwen3.8-27B/base-hf-bf16 \
+      --quantized-model /path/to/Qwen3.8-27B/vllm-nvfp4-fp8 \
+      --dflash-model /path/to/Qwen3.8-27B-DFlash2 \
+      --out out/qwen3_8_27b_nvfp4.ninfer
+
+Without the flag the plan, artifact, report, and stdout are unchanged.
 """
 
 from __future__ import annotations
@@ -37,6 +50,7 @@ from tools.convert.qwen3_6_27b import convert as family_config
 from tools.convert.qwen3_6_27b import draft_head
 
 from . import convert as base_convert
+from . import dflash2
 from . import fp8_embedding
 from . import inventory_nvfp4 as inventory
 from . import recipe_nvfp4 as recipe
@@ -44,6 +58,18 @@ from . import recipe_nvfp4 as recipe
 
 RECIPE_ID = "qwen3_8_27b_nvfp4-v1"
 OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.ninfer"
+
+# DFlash 2 section contract.  The 66-object / 81-source table has its single
+# home in dflash2.py (validated against the 27B bindings at import time);
+# these aliases let the preflight and the report cross-check the payload
+# total the way the 35B pipeline's expected-payload table records its
+# "dflash" entry (the NVFP4 pipeline has no expected-size table, so the
+# preflight asserts the recomputed total against the module constant).
+DFLASH2_SOURCE_REPOSITORY = dflash2.DFLASH2_REPOSITORY
+DFLASH2_SOURCE_REVISION = dflash2.DFLASH2_REVISION
+EXPECTED_DFLASH2_OBJECT_COUNT = dflash2.EXPECTED_OBJECT_COUNT
+EXPECTED_DFLASH2_SOURCE_COUNT = dflash2.EXPECTED_SOURCE_COUNT
+EXPECTED_DFLASH2_PAYLOAD_BYTES = dflash2.EXPECTED_PAYLOAD_BYTES
 
 _FP8_TARGETS = [
     r"re:.*self_attn\.(q|k|v|o)_proj$",
@@ -64,6 +90,10 @@ class ConversionPreflight:
     resources: tuple[family_conversion.ResourcePayload, ...]
     draft: draft_head.DraftHeadContext
     object_plan: family_conversion.ObjectPlan
+    dflash_dir: Path | None = None
+    dflash_config_summary: dict[str, object] | None = None
+    dflash_source: family_recipe.SourcePreflight | None = None
+    dflash_sha256: str | None = None
 
 
 def _repo_root() -> Path:
@@ -197,14 +227,28 @@ def preflight_inventory() -> None:
 
 def build_object_plan(
     resources: Mapping[str, bytes],
+    *,
+    include_dflash: bool = False,
 ) -> family_conversion.ObjectPlan:
+    """Plan the registered objects, plus the dflash section when requested.
+
+    Without ``include_dflash`` this is exactly the no-flag plan: the
+    additive DFlash 2 group never enters the default inventory totals.
+    With it, the 66 ``dflash/*`` objects are appended after the registered
+    ones, in :data:`inventory.DFLASH2_TENSOR_SPECS` (dflash2) order.
+    """
+
     preflight_inventory()
-    return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
+    specs: tuple[inventory.StoredObjectSpec, ...] = inventory.OBJECT_SPECS
+    if include_dflash:
+        specs = inventory.OBJECT_SPECS + inventory.DFLASH2_TENSOR_SPECS
+    return family_conversion.build_object_plan(specs, resources)
 
 
 def preflight_conversion(
     official_dir: str | Path,
     quantized_dir: str | Path,
+    dflash_dir: str | Path | None = None,
 ) -> ConversionPreflight:
     official = Path(official_dir)
     quantized = Path(quantized_dir)
@@ -227,9 +271,47 @@ def preflight_conversion(
     with ShardReader(quantized) as quantized_reader:
         quantized_source = recipe.preflight_quantized_metadata(quantized_reader)
 
+    # Optional DFlash 2 drafter section: every check runs in the preflight
+    # phase, before the writer opens, so a rejected dflash source leaves no
+    # byte on disk.
+    dflash = None
+    dflash_summary = None
+    dflash_source = None
+    dflash_sha = None
+    if dflash_dir is not None:
+        dflash = Path(dflash_dir)
+        dflash_summary = dflash2.validate_dflash2_config(
+            family_conversion.load_json(dflash / "config.json")
+        )
+        dflash_source = dflash2.preflight_dflash2_sources(dflash)
+        if (
+            dflash_source.source_tensor_count
+            != EXPECTED_DFLASH2_SOURCE_COUNT
+        ):
+            raise ValueError(
+                "DFlash 2 source preflight drifted: "
+                f"{dflash_source.source_tensor_count} sources, "
+                f"expected {EXPECTED_DFLASH2_SOURCE_COUNT}"
+            )
+        dflash_sha = dflash2.dflash2_source_sha256(dflash)
+        # Expected-payload cross-check for the dflash total (the 35B
+        # expected-payload table keeps a "dflash" byte entry; the NVFP4
+        # pipeline has no such table, so assert the recomputed total
+        # against the module constant here, before any byte is written).
+        dflash_bytes = family_conversion.tensor_payload_bytes(
+            inventory.DFLASH2_TENSOR_SPECS
+        )
+        if dflash_bytes != EXPECTED_DFLASH2_PAYLOAD_BYTES:
+            raise ValueError(
+                "DFlash 2 payload byte total drifted: "
+                f"{dflash_bytes}, expected {EXPECTED_DFLASH2_PAYLOAD_BYTES}"
+            )
+
     resources = base_convert.load_resources(official)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(resource_map)
+    object_plan = build_object_plan(
+        resource_map, include_dflash=dflash_dir is not None
+    )
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, official)
     return ConversionPreflight(
@@ -241,6 +323,10 @@ def preflight_conversion(
         resources=resources,
         draft=draft,
         object_plan=object_plan,
+        dflash_dir=dflash,
+        dflash_config_summary=dflash_summary,
+        dflash_source=dflash_source,
+        dflash_sha256=dflash_sha,
     )
 
 
@@ -287,6 +373,75 @@ def _materialize_official(
     return tensor
 
 
+def build_conversion_report(
+    *,
+    model_dir: str | Path,
+    out_path: str | Path,
+    arguments: Mapping[str, object],
+    config_summary: Mapping[str, object],
+    source_preflight: family_recipe.SourcePreflight,
+    objects: Sequence[ArtifactObject],
+    elapsed_seconds: float,
+    final_bytes: int,
+    device: torch.device,
+    ranking_path: str | Path,
+    dflash_model_dir: str | Path | None = None,
+    dflash_config_summary: Mapping[str, object] | None = None,
+    dflash_source: family_recipe.SourcePreflight | None = None,
+    dflash_sha256: str | None = None,
+) -> dict[str, object]:
+    """Build the shared report envelope for this recipe.
+
+    The ``dflash/*`` section is recorded only when ``dflash_model_dir`` is
+    given (together with the dflash preflight metadata); the no-flag report
+    is exactly the shared envelope.
+    """
+
+    report = family_conversion.build_conversion_report(
+        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        target_key=inventory.TARGET_KEY,
+        recipe_id=RECIPE_ID,
+        repo_root=_repo_root(),
+        model_dir=model_dir,
+        out_path=out_path,
+        arguments=arguments,
+        config_summary=config_summary,
+        source_preflight=source_preflight,
+        objects=objects,
+        elapsed_seconds=elapsed_seconds,
+        final_bytes=final_bytes,
+        device=device,
+        ranking_path=ranking_path,
+    )
+    if dflash_model_dir is None:
+        return report
+    if (
+        dflash_config_summary is None
+        or dflash_source is None
+        or dflash_sha256 is None
+    ):
+        raise ValueError(
+            "dflash_model_dir requires the dflash preflight metadata: "
+            "config summary, source preflight, and sha256"
+        )
+    report["dflash"] = {
+        "repository": DFLASH2_SOURCE_REPOSITORY,
+        "revision": DFLASH2_SOURCE_REVISION,
+        "model_path": str(Path(dflash_model_dir).resolve()),
+        "sha256": dflash_sha256,
+        "objects": EXPECTED_DFLASH2_OBJECT_COUNT,
+        "payload_bytes": EXPECTED_DFLASH2_PAYLOAD_BYTES,
+        "config_summary": dict(dflash_config_summary),
+        "source_preflight": {
+            "recipes": dflash_source.recipe_count,
+            "tensors": dflash_source.source_tensor_count,
+            "shards": dflash_source.source_shard_count,
+            "dtypes": dict(dflash_source.source_dtype_counts),
+        },
+    }
+    return report
+
+
 def _build_report(
     *,
     preflight: ConversionPreflight,
@@ -298,11 +453,7 @@ def _build_report(
     device: torch.device,
 ) -> dict[str, object]:
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
-    report = family_conversion.build_conversion_report(
-        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-        target_key=inventory.TARGET_KEY,
-        recipe_id=RECIPE_ID,
-        repo_root=_repo_root(),
+    report = build_conversion_report(
         model_dir=preflight.official_dir,
         out_path=output,
         arguments=arguments,
@@ -313,6 +464,10 @@ def _build_report(
         final_bytes=final_bytes,
         device=device,
         ranking_path=ranking,
+        dflash_model_dir=preflight.dflash_dir,
+        dflash_config_summary=preflight.dflash_config_summary,
+        dflash_source=preflight.dflash_source,
+        dflash_sha256=preflight.dflash_sha256,
     )
     report["source"] = {
         "official": {
@@ -353,8 +508,14 @@ def convert(
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
+    dflash_dir: str | Path | None = None,
 ) -> Path:
-    """Run the closed dual-source conversion and return its report path."""
+    """Run the closed dual-source conversion and return its report path.
+
+    With ``dflash_dir`` set, the 66-object DFlash 2 section (``dflash/*``)
+    is appended after the registered objects; without it the artifact and
+    report are byte-for-byte identical to the no-flag build.
+    """
 
     started = time.perf_counter()
     output = Path(out_path)
@@ -364,19 +525,40 @@ def convert(
         )
     requested_device = str(device)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(official_dir, quantized_dir)
+    preflight = preflight_conversion(official_dir, quantized_dir, dflash_dir)
 
+    dflash_detail = ""
+    if preflight.dflash_dir is not None:
+        dflash_detail = (
+            f", dflash={len(inventory.DFLASH2_TENSOR_SPECS)} objects from "
+            f"{preflight.dflash_source.source_tensor_count} source tensors"
+        )
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
         f"{len(recipe.FP8_SOURCES)} FP8 and "
-        f"{len(recipe.NVFP4_SOURCES)} NVFP4 source matrices, "
-        f"device={resolved_device}",
+        f"{len(recipe.NVFP4_SOURCES)} NVFP4 source matrices"
+        f"{dflash_detail}, device={resolved_device}",
         flush=True,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
     draft_ids = draft_head.materialize_draft_head_token_ids(preflight.draft)
     derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_ids}
+    total_objects = len(preflight.object_plan.objects)
+    index = 0
+
+    def write_payload(
+        spec: inventory.StoredObjectSpec,
+        payload: bytes | Iterable[bytes],
+    ) -> None:
+        nonlocal index
+        writer.write(spec.name, payload)
+        index += 1
+        print(
+            f"[{index}/{total_objects}] {spec.name}",
+            flush=True,
+        )
+
     with ShardReader(preflight.official_dir) as official_reader, ShardReader(
         preflight.quantized_dir
     ) as quantized_reader:
@@ -389,7 +571,7 @@ def convert(
                 raise RuntimeError(
                     "writer object plan differs from completed preflight"
                 )
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            for spec in inventory.OBJECT_SPECS:
                 payload: bytes | Iterable[bytes]
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
@@ -421,12 +603,22 @@ def convert(
                         tensor, spec, resolved_device
                     )
                     del tensor
-                writer.write(spec.name, payload)
+                write_payload(spec, payload)
                 del payload
-                print(
-                    f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
-                    flush=True,
-                )
+            if preflight.dflash_dir is not None:
+                # The dflash section is a single-file checkpoint; emit it
+                # through the dflash2 pipeline (materialize -> encode ->
+                # emit, one object at a time) on the same writer, so the
+                # 66 objects land after the registered ones, in inventory
+                # order.  The resolved device idiom mirrors the main loop.
+                with ShardReader.from_file(
+                    preflight.dflash_dir / dflash2.DFLASH2_TENSOR_FILENAME
+                ) as dflash_reader:
+                    dflash2.convert_dflash2(
+                        dflash_reader,
+                        write_payload,
+                        resolved_device,
+                    )
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
@@ -436,6 +628,8 @@ def convert(
         "out": str(out_path),
         "device": requested_device,
     }
+    if dflash_dir is not None:
+        arguments["dflash_model"] = str(dflash_dir)
     report = _build_report(
         preflight=preflight,
         output=output,
@@ -462,12 +656,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--quantized-model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--dflash-model",
+        default=None,
+        type=Path,
+        help=(
+            "optional directory holding the DFlash 2 draft checkpoint "
+            "(config.json + model.safetensors); appends the 66-object "
+            "dflash/* section to the artifact"
+        ),
+    )
     arguments = parser.parse_args(argv)
     convert(
         arguments.model,
         arguments.quantized_model,
         arguments.out,
         device=arguments.device,
+        dflash_dir=arguments.dflash_model,
     )
 
 

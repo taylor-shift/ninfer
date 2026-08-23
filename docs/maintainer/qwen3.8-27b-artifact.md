@@ -751,3 +751,204 @@ python3 -m tools.convert.qwen3_8_27b.convert \
 The converter validates the official checkpoint, frontend resources, complete object plan, and
 numeric recipes before opening the output, then writes the sibling
 `qwen3_8_27b.ninfer.conversion.json` report.
+
+## 14. DFlash 2 section
+
+Sections 1 through 12 define the registered NVFP4 fleet image and its 1124 objects. The NVFP4
+pipeline can also build a DFlash-augmented image that carries the same registered identity. That
+image is a separate artifact, not a modification of the fleet image: built without the
+`--dflash-model` flag, the pipeline writes the 1124-object image of Section 9.1 with its identity,
+sequence, shapes, formats, layouts, and stored values unchanged.
+
+The first 1124 objects of the DFlash-augmented image retain the existing sequence of Section 4.1.
+The 66 DFlash tensor objects of this section are appended after the Vision merger objects. Existing
+object names, order, shapes, formats, layouts, payload-relative offsets, and stored values are
+unchanged.
+
+DFlash 2 is a block-diffusion drafter with a path selector and two-tap grouped dynamic
+convolutions. All five of its layers are sliding-window attention. Unlike the 35B drafter, whose
+sixth layer is full-context, the 27B drafter has no full-attention layer, and the `dflash.full`
+paged cache is eliminated: every full-cache allocation and call site is gated on a full layer that
+does not exist (spec 06, decision D2), the rewrite checkpoints copy local lanes only, and the 35B
+path is unchanged.
+
+### 14.1 DFlash-global objects
+
+| Order | Object name | Shape | Format |
+|---:|---|---|---|
+| 0 | `dflash/feature_projection` | `[5120,25600]` | `W8G32_F16S` |
+| 1 | `dflash/context_norm` | `[5120]` | `BF16` |
+
+`dflash/feature_projection` multiplies the five target feature layers — the post-layer hidden
+states of Text layers 5, 19, 33, 47, and 61, `5 x 5120 = 25600` input columns — into the drafter
+hidden state. `dflash/context_norm` normalizes the fresh context feature from which the round-entry
+K/V re-projection is computed.
+
+### 14.2 DFlash layer
+
+For every DFlash layer `l` in `0..4`, emit these twelve objects:
+
+| Order | Object-name pattern | Shape | Format |
+|---:|---|---|---|
+| 0 | `dflash/layers/{l}/input_norm` | `[5120]` | `BF16` |
+| 1 | `dflash/layers/{l}/attention/query_key_value` | `[6144,5120]` | `W8G32_F16S` |
+| 2 | `dflash/layers/{l}/attention/query_norm` | `[128]` | `BF16` |
+| 3 | `dflash/layers/{l}/attention/key_norm` | `[128]` | `BF16` |
+| 4 | `dflash/layers/{l}/attention/output` | `[5120,4096]` | `W8G32_F16S` |
+| 5 | `dflash/layers/{l}/post_attention_norm` | `[5120]` | `BF16` |
+| 6 | `dflash/layers/{l}/mlp/gate_up` | `[34816,5120]` | `W8G32_F16S` |
+| 7 | `dflash/layers/{l}/mlp/down` | `[5120,17408]` | `W8G32_F16S` |
+| 8 | `dflash/layers/{l}/attention_conv/base_kernel` | `[2,2,5120]` | `BF16` |
+| 9 | `dflash/layers/{l}/attention_conv/kernel_projection` | `[1280,5120]` | `BF16` |
+| 10 | `dflash/layers/{l}/mlp_conv/base_kernel` | `[2,2,5120]` | `BF16` |
+| 11 | `dflash/layers/{l}/mlp_conv/kernel_projection` | `[1280,5120]` | `BF16` |
+
+All five layers are sliding-window layers with window 2048; there is no full-context layer. The
+attention class is not encoded in an object name or metadata field.
+
+The following concatenations define physical output-row order:
+
+- every DFlash attention input: `[query,key,value]`;
+- every DFlash MLP input: `[gate,up]`.
+
+| Parent object | Logical role | Stored row selection | Shape |
+|---|---|---|---|
+| `dflash/layers/{l}/attention/query_key_value` | query | `[0,4096)` | `[4096,5120]` |
+| same | key | `[4096,5120)` | `[1024,5120]` |
+| same | value | `[5120,6144)` | `[1024,5120]` |
+| `dflash/layers/{l}/mlp/gate_up` | gate | `[0,17408)` | `[17408,5120]` |
+| same | up | `[17408,34816)` | `[17408,5120]` |
+
+The key and value row views of `attention/query_key_value` are the `context_key` and
+`context_value` views re-projected from the fresh context feature at round entry, following the
+35B DFlash pattern. The convolutions never touch the context path.
+
+### 14.3 DFlash-final and selector objects
+
+| Order | Object name | Shape | Format |
+|---:|---|---|---|
+| 0 | `dflash/final_norm` | `[5120]` | `BF16` |
+| 1 | `dflash/selector/predecessor_codebook` | `[248320,256]` | `BF16` |
+| 2 | `dflash/selector/successor_codebook` | `[248320,256]` | `BF16` |
+| 3 | `dflash/selector/hidden_projection` | `[256,5120]` | `BF16` |
+
+The DFlash section has no private token-embedding object, mask-embedding object, output-head
+object, or shortlist-head object.
+
+| Logical consumer role | Stored object or view |
+|---|---|
+| DFlash anchor-token embedding | row view of `text/token_embedding` |
+| DFlash mask embedding | row 248070 of `text/token_embedding` |
+| DFlash proposal output head | `text/output_head` |
+
+Storage and numeric assignment for the section:
+
+- the 21 `W8G32_F16S` objects use encoder profile `MAXABS_F16_RECIP_RNE_V1` and storage layout
+  `row-split-k128-v1`, the same assignment as the MTP matrices in Section 3.1;
+- the 45 `BF16` objects use `contiguous-le-v1` and preserve the source BF16 words after the
+  stated concatenations;
+- the rank-3 convolution kernels keep their source `(use, tap, hidden)` shape, with the `use`
+  index selecting the conv attachment point.
+
+The section contains exactly 66 tensor objects: 2 globals, 5 layers of 12, and 4 final and
+selector objects.
+
+### 14.4 Fixed DFlash facts
+
+| Fact | Value |
+|---|---:|
+| DFlash layers / hidden / intermediate width | 5 / 5120 / 17408 |
+| DFlash query / KV heads / head width | 32 / 8 / 128 |
+| DFlash query / KV widths | 4096 / 1024 |
+| DFlash sliding-window layers / window | `0..4` / 2048 |
+| DFlash full-context layer | none |
+| DFlash mask-token row | 248070 |
+| DFlash target-feature layers | `[5,19,33,47,61]` |
+| DFlash target-feature input width | `5 x 5120 = 25600` |
+| DFlash block size / draft positions | 8 / 7 |
+| DFlash convolution kernel / group size | 2 / 16 |
+| DFlash selector rank / top-k | 256 / 16 |
+
+Block 8 is one anchor position plus seven draft positions. The per-target maximum is seven draft
+tokens; `--draft-tokens` on this target validates against `1..7`, and the family maximum of 15
+draft tokens is unchanged. The mask token is a tokenizer-addressable row of
+`text/token_embedding` (Section 2 domain `0..248076`), unlike the 35B drafter's padded mask row
+248077.
+
+### 14.5 Runtime contract
+
+The DFlash 2 drafter proposes block 8 (anchor plus up to seven draft positions) per verify round.
+Draft logits are produced by the target's full output head `text/output_head`. The 131,072-row
+optimized draft head is a subset of that head and is rejected for this target under
+`--spec dflash`: `--lm-head-draft` is incompatible, and the engine rejects the combination with
+the message `--spec dflash on this target requires the full output head (--lm-head-draft is
+incompatible)`.
+
+The path selector replaces the v1 argmax proposal. For each draft column it takes the top-16
+candidates over the full 248,320-row vocabulary with a deterministic lower-id tie-break, projects
+the draft hidden state through the 256-rank `dflash/selector/hidden_projection`, forms the
+16 x 16 edge-score tables from the predecessor and successor codebooks, and walks the dependent
+draft positions one at a time. The walk applies temperature scaling only — no top-p, top-k, min-p,
+or penalties — and its multinomial draws use sampling purpose `kSamplePurposeDflashSelector = 5`;
+greedy rows take the argmax over the 16 with a lower-id tie-break. Candidates, edge scores, and
+walk logits are computed in FP32 end-to-end.
+
+Each layer wraps its attention and MLP sublayer inputs and outputs, before the residual add, in
+two-tap grouped dynamic causal convolutions:
+
+```text
+out[t,c] = (base[use,0,c] + dyn[t,floor(c/16)]) * x[t,c]
+         + (base[use,1,c] + dyn[t,320 + floor(c/16)]) * x[t-1,c]
+```
+
+`base` is the stored `[2,2,5120]` kernel and `dyn[t,·]` is the t-th column of the 1280-row
+`kernel_projection` GEMM output, whose rows `[0,640)` and `[640,1280)` are the two `use` slices
+laid out as `[use][offset][group]` over 320 groups of 16 channels. The convolution accumulates in
+FP32, stores BF16, and is zero-padded at the block start. Two engine layout laws constrain these
+shapes: contiguous tensors store the first dimension fastest (a GEMM output `[R,C]` holds column
+`c` as a contiguous `R`-element block at offset `c·R`), and the packed draft columns are
+batch-major with column index `b·k + t` (batch row `b` slowest, 0-based draft position `t`
+fastest). The anchor zero-padding therefore applies at every batch row's anchor column, not only
+at the first column; each batch row is an independent block-diffusion sequence.
+
+### 14.6 Payload and resident cost
+
+The DFlash section payload is 2,226,792,960 bytes: the 21 `W8G32_F16S` GEMM weights at 1.0625
+B/param (1,730.2 Mparams, including the binary16 scale per 32-group) and the 45 `BF16` norms,
+convolution kernels, and selector tensors at 2 B/param (194.3 Mparams). The conversion preflight
+validates this section total before any output byte is written.
+
+The drafter resident cost is ≈ 2.07 GiB (≈ 1.71 GiB W8G32 + ≈ 0.36 GiB BF16) against 3.58 GiB for
+the same 1,924.4 Mparams stored BF16 — the checkpoint's own 1,924,404,480-parameter total.
+
+### 14.7 Source and converter usage
+
+| Source identity | Revision | Files |
+|---|---|---|
+| `z-lab/Qwen3.8-27B-DFlash2` | `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | `config.json` and `model.safetensors` (81 BF16 tensors) |
+
+The converter validates the exact 81-tensor DFlash source set, the config facts of Section 14.4,
+and the 2,226,792,960-byte section payload total before opening the output. The conversion report
+gains a `dflash` section recording the source repository, revision, and resolved model path, the
+`model.safetensors` sha256, the validated config facts, and the 66-object and
+2,226,792,960-byte section totals; the `--dflash-model` argument is recorded with the other
+conversion arguments.
+
+The registered fleet image is built without the DFlash flag:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
+  --model /path/to/Qwen3.8-27B/base-hf-bf16 \
+  --quantized-model /path/to/Qwen3.8-27B/vllm-nvfp4-fp8 \
+  --out out/qwen3_8_27b_nvfp4.ninfer
+```
+
+The DFlash-augmented image appends the section with `--dflash-model`:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
+  --model /path/to/Qwen3.8-27B/base-hf-bf16 \
+  --quantized-model /path/to/Qwen3.8-27B/vllm-nvfp4-fp8 \
+  --dflash-model /path/to/Qwen3.8-27B-DFlash2 \
+  --out out/qwen3_8_27b_nvfp4.ninfer
+```

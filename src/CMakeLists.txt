@@ -65,6 +65,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
+  ops/launcher/dflash_selector.cu
   ops/launcher/embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
@@ -72,6 +73,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/swa.cu
   ops/launcher/gqa_attention_decode.cu
   ops/launcher/gqa_attention_prefill.cu
+  ops/launcher/grouped_dynamic_conv.cu
   ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
@@ -228,6 +230,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
+  ops/wrapper/dflash_selector.cpp
   ops/wrapper/embedding.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
@@ -236,6 +239,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/bidirectional_gqa_attention.cpp
   ops/wrapper/swa.cpp
   ops/wrapper/gqa_attention.cpp
+  ops/wrapper/grouped_dynamic_conv.cpp
   ops/wrapper/kv_cache_append_prefix.cpp
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp

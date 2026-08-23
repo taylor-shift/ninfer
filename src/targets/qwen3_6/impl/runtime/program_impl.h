@@ -891,13 +891,17 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        return &dflash->full.value();
+    }
     return nullptr;
 }
 
 const qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        return &dflash->full.value();
+    }
     return nullptr;
 }
 
@@ -1088,8 +1092,8 @@ void ProgramImplCore::prepare_graphs() {
     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        reserve_capture_rows(dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
+    } else if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        reserve_capture_rows(dflash->full.value(), dflash_capture_allocations, "DFlash Full KV cache");
     }
     device.synchronize();
 
@@ -1145,7 +1149,9 @@ void ProgramImplCore::prepare_graphs() {
         if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
         }
-        if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
+        if (dflash && dflash->full) {
+            zero_capture_pages(dflash->full.value(), dflash_capture_allocations, batch_size);
+        }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
             decoder->linear_attention.zero_slot(
                 LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);

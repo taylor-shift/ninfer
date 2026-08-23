@@ -21,6 +21,7 @@ namespace ninfer::targets::qwen3_6_27b::detail {
 inline constexpr std::size_t kTextLayers          = 64;
 inline constexpr std::size_t kFullAttentionLayers = 16;
 inline constexpr std::size_t kGdnLayers           = 48;
+inline constexpr std::size_t kDFlashLayers        = 5;
 
 struct WeightPlan {
     artifact::ObjectHandle object;
@@ -104,6 +105,38 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+struct DFlashConvPlan {
+    artifact::ObjectHandle base_kernel;
+    artifact::ObjectHandle kernel_projection;
+};
+
+struct DFlashLayerPlan {
+    artifact::ObjectHandle input_norm;
+    artifact::ObjectHandle query_key_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    artifact::ObjectHandle attention_output;
+    artifact::ObjectHandle post_attention_norm;
+    artifact::ObjectHandle gate_up;
+    artifact::ObjectHandle down;
+    DFlashConvPlan attention_conv;
+    DFlashConvPlan mlp_conv;
+};
+
+struct DFlashSelectorPlan {
+    artifact::ObjectHandle predecessor_codebook;
+    artifact::ObjectHandle successor_codebook;
+    artifact::ObjectHandle hidden_projection;
+};
+
+struct DFlashPlan {
+    artifact::ObjectHandle feature_projection;
+    artifact::ObjectHandle context_norm;
+    std::array<DFlashLayerPlan, kDFlashLayers> layers;
+    artifact::ObjectHandle final_norm;
+    DFlashSelectorPlan selector;
+};
+
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
@@ -121,6 +154,7 @@ struct BindingPlan {
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    DFlashPlan dflash;
 };
 
 struct ArtifactLoadPlan {
@@ -189,11 +223,13 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<5>,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
+using DFlashWeights        = RuntimeModelView::DFlash;
+using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
 
 class LoadedModelData {
 public:

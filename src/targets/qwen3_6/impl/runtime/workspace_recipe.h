@@ -288,4 +288,49 @@ DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
     };
 }
 
+// DFlash 2 path selector (spec doc 06 section 8): draft columns cols = drafts*batch, drafts in
+// [1,7], batch in [1,8]. scores is the full 4-D [k,16,16,B] edge-score table the walk reads.
+struct DFlashSelectorRoots {
+    Tensor candidates;
+    Tensor unary;
+    Tensor hidden_proj;
+    Tensor scores;
+};
+
+template <class Config, class Allocator>
+DFlashSelectorRoots dflash_selector(Allocator& allocator, std::int32_t drafts, std::int32_t batch) {
+    const std::int32_t cols = drafts * batch;
+    return {
+        matrix(allocator, DType::I32, Config::selector_top_k, cols),
+        matrix(allocator, DType::FP32, Config::selector_top_k, cols),
+        matrix(allocator, DType::BF16, Config::selector_rank, cols),
+        allocator.alloc(DType::FP32, {drafts, Config::selector_top_k, Config::selector_top_k,
+                                      batch}),
+    };
+}
+
+// DFlash 2 grouped dynamic convs (spec doc 06 decision D7), per layer over the full block columns
+// tokens = (drafts+1)*batch. Each *_dynamic is the kernel_projection GEMM output [2*conv_kernel*
+// (hidden/conv_group_size), tokens] holding the two tap use-slices (rows [0:640) and [640:1280)
+// for the 27B geometry); each *_out is the shared [hidden, tokens] destination of that conv's two
+// applications (input-side then output-side; never live together).
+struct DFlashConvLayerRoots {
+    Tensor attention_dynamic;
+    Tensor attention_out;
+    Tensor mlp_dynamic;
+    Tensor mlp_out;
+};
+
+template <class Config, class Allocator>
+DFlashConvLayerRoots dflash_conv_layer(Allocator& allocator, std::int32_t tokens) {
+    const std::int32_t dynamic_rows =
+        2 * Config::conv_kernel_size * (Config::hidden / Config::conv_group_size);
+    return {
+        matrix(allocator, DType::BF16, dynamic_rows, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, dynamic_rows, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+    };
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe

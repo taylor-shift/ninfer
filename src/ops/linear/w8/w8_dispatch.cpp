@@ -59,6 +59,14 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 895) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
+        // DFlash 2 27B: attention output {5120,4096} (query_size 4096 -> hidden 5120).
+        // Shape-generic launchers only; generic mma fallback, no T upper bound.
+        if (n == 5120) {
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            if (t <= 48) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
         break;
     case 2048:
         switch (n) {
@@ -98,6 +106,38 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
+    // DFlash 2 27B: feature projection fc {5120,25600} (5 x 5120 feature rows -> hidden 5120).
+    // Mirrors the 35B dflash feature class below (case 16384) with shape-generic launchers
+    // only: the 35B decode/splitk/medium/small-T ladder entries are shape-specific to
+    // {2048,16384}, so t=1..16 uses the generic simt tier instead; the generic mma tier
+    // ranges are carried over verbatim. Generic mma fallback, no T upper bound.
+    case 25600:
+        if (n != 5120) { break; }
+        if (t <= 4) { return launch_w8_simt_r8_c4; }
+        if (t <= 16) { return launch_w8_simt_r8_c8; }
+        if (t <= 255) { return launch_w8_mma_r32_c128; }
+        if (t <= 384) { return launch_w8_mma_r32_c64; }
+        if (t <= 480) { return launch_w8_mma_r32_c96; }
+        if (t <= 640) { return launch_w8_mma_r32_c128; }
+        if (t <= 672) { return launch_w8_mma_r48_c96; }
+        if (t <= 704) { return launch_w8_mma_r48_c64; }
+        if (t <= 784) { return launch_w8_mma_r48_c112; }
+        if (t <= 896) { return launch_w8_mma_r48_c128; }
+        if (t <= 960) { return launch_w8_mma_r64_c96; }
+        if (t <= 1008) { return launch_w8_mma_r64_c112; }
+        if (t <= 1119) { return launch_w8_mma_r64_c128; }
+        if (t == 1120) { return launch_w8_mma_r64_c112; }
+        if (t <= 1280) { return launch_w8_mma_r64_c128; }
+        if (t <= 1344) { return launch_w8_mma_r128_c64; }
+        if (t <= 1440) { return launch_w8_mma_r96_c96; }
+        if (t <= 1680) { return launch_w8_mma_r128_c80; }
+        if (t <= 1791) { return launch_w8_mma_r48_c128; }
+        if (t == 1792) { return launch_w8_mma_r64_c128; }
+        if (t <= 1919) { return launch_w8_mma_r48_c128; }
+        if (t == 1920) { return launch_w8_mma_r64_c128; }
+        if (t <= 2016) { return launch_w8_mma_r64_c96; }
+        if (t <= 2112) { return launch_w8_mma_r96_c96; }
+        return launch_w8_mma_r64_c128;
     case 16384:
         if (n != 2048) { break; }
         if (t == 1) { return launch_w8_decode_r4; }

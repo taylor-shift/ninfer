@@ -157,26 +157,31 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
-            PagedKVPoolSpec full_pool{
-                .page_group_count      = physical_pages,
-                .logical_page_capacity = logical_pages,
-                .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
-                .plane_order           = PagedKVPlaneOrder::HeadMajor,
-                .planes =
-                    {
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                    },
-            };
-            dflash.full = qwen3_6::PagedKVCacheLayout{
-                .pool        = plan_paged_kv_pool(builder, full_pool),
-                .layers      = 1,
-                .max_context = plan.capacity,
-                .kv_heads    = DFlashConfig::kv_heads,
-                .head_dim    = DFlashConfig::head_dim,
-                .dtype       = DType::BF16,
-                .quant_group = 0,
-            };
+            // The full-attention paged cache exists only for drafters with at least one full layer.
+            // A pure-SWA drafter (local_layers == layers) never reads or writes dflash.full, so
+            // its pool is compile-time eliminated; the local cyclic windows stay unconditional.
+            if constexpr (DFlashConfig::local_layers < DFlashConfig::layers) {
+                PagedKVPoolSpec full_pool{
+                    .page_group_count      = physical_pages,
+                    .logical_page_capacity = logical_pages,
+                    .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
+                    .plane_order           = PagedKVPlaneOrder::HeadMajor,
+                    .planes =
+                        {
+                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                            {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        },
+                };
+                dflash.full = qwen3_6::PagedKVCacheLayout{
+                    .pool        = plan_paged_kv_pool(builder, full_pool),
+                    .layers      = 1,
+                    .max_context = plan.capacity,
+                    .kv_heads    = DFlashConfig::kv_heads,
+                    .head_dim    = DFlashConfig::head_dim,
+                    .dtype       = DType::BF16,
+                    .quant_group = 0,
+                };
+            }
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
                 "DFlash prefill target features");
@@ -493,6 +498,25 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, ops::linear_add_workspace_capacity_bytes(
                                         QType::W8G32_F16S, DFlashConfig::hidden,
                                         DFlashConfig::intermediate, tokens, tokens));
+                }
+                // DFlash 2 propose-path roots (grouped dynamic convs + path selector) are gated by
+                // the Config fields the v1 drafter leaves at zero, so this is a no-op for them.
+                // Sizes are counted at the target worst case (k = kMaximumDFlashDraftTokens,
+                // B = kMaximumConcurrency) so the probe stays valid for every draft window the
+                // target admits.
+                if constexpr (DFlashConfig::selector_top_k > 0) {
+                    (void)workspace_recipe::dflash_selector<DFlashConfig>(
+                        layout, static_cast<std::int32_t>(kMaximumDFlashDraftTokens),
+                        static_cast<std::int32_t>(kMaximumDFlashConcurrency));
+                }
+                if constexpr (DFlashConfig::conv_kernel_size > 0) {
+                    const std::int32_t block_tokens =
+                        static_cast<std::int32_t>(kMaximumDFlashDraftTokens + 1U) *
+                        static_cast<std::int32_t>(kMaximumDFlashConcurrency);
+                    for (std::size_t layer = 0; layer < static_cast<std::size_t>(DFlashConfig::layers);
+                         ++layer) {
+                        (void)workspace_recipe::dflash_conv_layer<DFlashConfig>(layout, block_tokens);
+                    }
                 }
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
                 matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
