@@ -55,6 +55,16 @@ inline void cuda_synchronize(cudaStream_t stream) {
     cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 }
 
+// Context-carrying sync: the plain variant's error text does not say which launch hit a
+// sticky error, so test phases sync with their phase name attached.
+inline void cuda_synchronize_ctx(const char* context) {
+    const cudaError_t e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+        throw std::runtime_error(std::string("cudaDeviceSynchronize [") + context +
+                                 "]: " + cudaGetErrorString(e));
+    }
+}
+
 inline bool cuda_unavailable() {
     int n               = 0;
     const cudaError_t e = cudaGetDeviceCount(&n);

@@ -27,6 +27,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <limits>
 #include <string>
 #include <utility>
@@ -40,6 +44,53 @@ namespace {
 constexpr std::int32_t kVocab = 248320;
 constexpr std::int32_t kTopK  = 16;
 constexpr std::int32_t kRank  = 256;
+
+// --- structured logging --------------------------------------------------------
+// Timestamped, flushed lines so a single paste-back of the test output names the
+// environment, the exact launch that died, and how far each phase got (a sticky
+// IMC only surfaces at the next sync; without these lines the log is one
+// unattributed terminate).
+std::string ts_now() {
+    using namespace std::chrono;
+    const auto now      = system_clock::now();
+    const auto sec      = system_clock::to_time_t(now);
+    const auto ms       = duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000;
+    std::tm tm {};
+    localtime_r(&sec, &tm);
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec,
+                  static_cast<int>(ms));
+    return std::string(buf);
+}
+inline void logc(const std::string& m) { std::cout << "[" << ts_now() << "] " << m << std::endl; }
+long long ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+}
+std::string fmt_bytes(std::size_t b) {
+    char buf[40];
+    if (b >= (std::size_t{1} << 30)) { std::snprintf(buf, sizeof buf, "%.2f GiB", (double)b / (double)(1u << 30)); }
+    else if (b >= (std::size_t{1} << 20)) { std::snprintf(buf, sizeof buf, "%.2f MiB", (double)b / (double)(1u << 20)); }
+    else if (b >= (std::size_t{1} << 10)) { std::snprintf(buf, sizeof buf, "%.1f KiB", (double)b / (double)(1u << 10)); }
+    else { std::snprintf(buf, sizeof buf, "%zu B", b); }
+    return std::string(buf);
+}
+void log_environment() {
+    int n = 0;
+    cuda_check(cudaGetDeviceCount(&n), "cudaGetDeviceCount");
+    if (n <= 0) { return; }
+    cudaDeviceProp prop {};
+    cuda_check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
+    std::size_t free_b = 0, total_b = 0;
+    cuda_check(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+    int v = 0;
+    cuda_check(cudaRuntimeGetVersion(&v), "cudaRuntimeGetVersion");
+    logc("env: device="" + std::string(prop.name) + "" cc=" + std::to_string(prop.major) + "." +
+         std::to_string(prop.minor) + " cudart=" + std::to_string(v / 1000) + "." +
+         std::to_string((v / 10) % 100) + " gpu_mem total=" + fmt_bytes(total_b) + " free=" +
+         fmt_bytes(free_b));
+}
 
 // --- deterministic 64-bit LCG (test fixture values only) ----------------------
 std::uint64_t lcg_next(std::uint64_t& state) {
@@ -178,10 +229,13 @@ int run_topk() {
     Tensor logits_tensor(device_logits.data(), DType::BF16, {kVocab, kTopkColumns});
     Tensor candidates_tensor(device_candidates.data(), DType::I32, {kTopK, kTopkColumns});
     Tensor unary_tensor(device_unary.data(), DType::FP32, {kTopK, kTopkColumns});
-    std::cout << "[phase] topk: launching" << std::endl;
+    logc("topk: launch grid=(" + std::to_string(kTopkColumns) + ",1,1) block=256 logits=" +
+         fmt_bytes(device_logits.bytes()) + " candidates=" + fmt_bytes(device_candidates.bytes()) +
+         " unary=" + fmt_bytes(device_unary.bytes()));
+    const auto topk_t0 = std::chrono::steady_clock::now();
     ops::dflash_selector_topk(logits_tensor, candidates_tensor, unary_tensor, nullptr);
-    cuda_synchronize();
-    std::cout << "[phase] topk: synced" << std::endl;
+    cuda_synchronize_ctx("topk");
+    logc("topk: synced in " + std::to_string(ms_since(topk_t0)) + " ms");
 
     int failures = 0;
     failures += verify_exact(
@@ -195,6 +249,7 @@ int run_topk() {
     failures += device_logits.verify_guards("selector topk logits");
     failures += device_candidates.verify_guards("selector topk candidates");
     failures += device_unary.verify_guards("selector topk unary");
+    logc("topk: checks done, failures=" + std::to_string(failures));
     return failures;
 }
 
@@ -304,11 +359,15 @@ int run_scores() {
     Tensor succ_tensor(device_succ.data(), DType::BF16, {kVocab, kRank});
     Tensor scores_tensor(device_scores.data(), DType::FP32,
                          {kScoresK, kTopK, kTopK, kScoresB});
-    std::cout << "[phase] scores: launching" << std::endl;
+    logc("scores: launch grid=(" + std::to_string(kScoresB) + "," + std::to_string(kScoresK) +
+         ",1) block=256 k=" + std::to_string(kScoresK) + " B=" + std::to_string(kScoresB) +
+         " codebooks=2x" + fmt_bytes(device_pred.bytes()) + " scores=" +
+         fmt_bytes(device_scores.bytes()));
+    const auto scores_t0 = std::chrono::steady_clock::now();
     ops::dflash_selector_scores(candidates_tensor, hidden_tensor, anchors_tensor, unary_tensor,
                                 pred_tensor, succ_tensor, scores_tensor, nullptr);
-    cuda_synchronize();
-    std::cout << "[phase] scores: synced" << std::endl;
+    cuda_synchronize_ctx("scores");
+    logc("scores: synced in " + std::to_string(ms_since(scores_t0)) + " ms");
 
     int failures = 0;
     // FP32 accumulation of a 256-term contraction over |term| <= 0.125: the ulp-based
@@ -356,6 +415,7 @@ int run_scores() {
     failures += device_pred.verify_guards("selector scores pred_codebook");
     failures += device_succ.verify_guards("selector scores succ_codebook");
     failures += device_scores.verify_guards("selector scores scores");
+    logc("scores: checks done, failures=" + std::to_string(failures));
     return failures;
 }
 
@@ -540,11 +600,16 @@ WalkRun run_walk(const std::vector<float>& scores, const std::vector<std::int32_
     Tensor scores_tensor(device_scores.data(), DType::FP32, {k, kTopK, kTopK, b_count});
     Tensor candidates_tensor(device_candidates.data(), DType::I32, {kTopK, k * b_count});
     Tensor drafts_tensor(device_drafts.data(), DType::I32, {k * b_count, 1});
-    std::cout << "[phase] walk(" << label << "): launching" << std::endl;
+    logc("walk(" + std::string(label) + "): launch grid=(" + std::to_string(b_count) +
+         ",1,1) block=256 k=" + std::to_string(k) + " B=" + std::to_string(b_count) +
+         " scores=" + fmt_bytes(device_scores.bytes()) + " candidates=" +
+         fmt_bytes(device_candidates.bytes()));
+    const auto walk_t0 = std::chrono::steady_clock::now();
     ops::dflash_selector_walk(scores_tensor, candidates_tensor, configs.data(), drafts_tensor,
                               nullptr);
-    cuda_synchronize();
-    std::cout << "[phase] walk(" << label << "): synced" << std::endl;
+    cuda_synchronize_ctx(("walk(" + std::string(label) + ")").c_str());
+    logc("walk(" + std::string(label) + "): synced in " + std::to_string(ms_since(walk_t0)) +
+         " ms");
 
     WalkRun run;
     run.drafts   = from_device<std::int32_t>(device_drafts.data(), static_cast<std::size_t>(k) * b_count);
@@ -802,13 +867,20 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    log_environment();
 
     int failures = 0;
+    logc("phase 1/4: topk");
     failures += run_topk();
+    logc("phase 2/4: scores");
     failures += run_scores();
+    logc("phase 3/4: walk");
     failures += run_walks();
+    logc("phase 4/4: rejection cases");
     failures += rejection_cases();
 
+    logc(failures == 0 ? "RESULT: OK — all checks passed"
+                       : "RESULT: FAIL — " + std::to_string(failures) + " check failures");
     std::cout << (failures == 0 ? "OK" : "FAIL") << " dflash_selector\n";
     return failures == 0 ? 0 : 1;
 }

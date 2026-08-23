@@ -5,11 +5,23 @@
 #include "ops/launcher/dflash_selector.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::ops {
 namespace {
+
+// NINFER_LOG_OPS=1 (set by the acceptance script for GPU test runs): trace public-API
+// entries so a failure log shows exactly what reached the validated boundary.
+const bool kLogOps = std::getenv("NINFER_LOG_OPS") != nullptr;
+void op_log(const std::string& m) {
+    if (kLogOps) {
+        std::fprintf(stderr, "[dflash_selector] %s\n", m.c_str());
+        std::fflush(stderr);
+    }
+}
 
 constexpr std::int32_t kSelectorVocab = 248320;
 constexpr std::int32_t kSelectorTopK  = 16;
@@ -59,6 +71,7 @@ void dflash_selector_topk(const Tensor& logits, Tensor& candidates, Tensor& unar
     if (overlaps(logits, candidates) || overlaps(logits, unary) || overlaps(candidates, unary)) {
         throw std::invalid_argument(std::string(op) + ": inputs and outputs must not overlap");
     }
+    op_log(std::string("topk: in (vocab=248320 C=") + std::to_string(cols) + ")");
     detail::dflash_selector_topk_launch(logits, candidates, unary, cols, stream);
 }
 
@@ -93,6 +106,8 @@ void dflash_selector_scores(const Tensor& candidates, const Tensor& hidden_proj,
                                                                                scores)) {
         throw std::invalid_argument(std::string(op) + ": inputs and outputs must not overlap");
     }
+    op_log(std::string("scores: in (k=") + std::to_string(k) + " B=" + std::to_string(b_count) +
+           " cols=" + std::to_string(cols) + ")");
     detail::dflash_selector_scores_launch(candidates, hidden_proj, anchors, unary, pred_codebook,
                                           succ_codebook, scores, k, b_count, stream);
 }
@@ -120,6 +135,7 @@ void dflash_selector_walk(const Tensor& scores, const Tensor& candidates,
     if (overlaps(scores, drafts) || overlaps(candidates, drafts)) {
         throw std::invalid_argument(std::string(op) + ": inputs and outputs must not overlap");
     }
+    op_log(std::string("walk: in (k=") + std::to_string(k) + " B=" + std::to_string(b_count) + ")");
     detail::dflash_selector_walk_launch(scores, candidates, configs, drafts, k, b_count, stream);
 }
 
