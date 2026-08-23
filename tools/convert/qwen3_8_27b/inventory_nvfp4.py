@@ -26,6 +26,13 @@ from . import dflash2
 
 MODEL_ID = "qwen3.8-27b"
 WEIGHTS_ID = "nvfp4"
+# The DFlash 2 build appends the 66-object dflash/ section to the registered
+# inventory; per the version-2 container evolution rule a changed full
+# inventory under one model publishes under a new weights_id, so the
+# DFlash-augmented image publishes as qwen3.8-27b/nvfp4-dflash2. The 27B target
+# registry resolves both identities to the same nvfp4 profile
+# (src/targets/qwen3_6_27b/impl/package.cpp).
+WEIGHTS_ID_DFLASH2 = "nvfp4-dflash2"
 TARGET_KEY = "qwen3_8_27b"
 
 NVFP4 = "NVFP4"
@@ -467,6 +474,8 @@ __all__ = [
     "TensorSpec",
     "VISION_TENSOR_SPECS",
     "W8",
+    "WEIGHTS_ID",
+    "WEIGHTS_ID_DFLASH2",
     "tensor_spec",
     "validate_inventory",
 ]

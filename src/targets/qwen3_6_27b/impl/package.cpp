@@ -95,6 +95,16 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    // The DFlash 2 build appends the 66-object dflash/ section to the
+    // registered inventory; the version-2 container evolution rule
+    // (docs/maintainer/artifact-container.md Section 9) publishes a changed
+    // full inventory under a new weights_id, so the augmented image is
+    // qwen3.8-27b/nvfp4-dflash2. It resolves to the same nvfp4 profile;
+    // the dflash tensor group's residency is then selected by the Engine
+    // startup features, exactly like the registered fleet nvfp4 image.
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-dflash2") {
+        return WeightsProfile::Qwen38Nvfp4;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }

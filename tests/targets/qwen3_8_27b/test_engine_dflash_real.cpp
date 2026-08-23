@@ -106,14 +106,17 @@ ninfer::PromptInput altered_history_after_boundary() {
 }
 
 int verify_dflash_load(const ninfer::Engine& engine, std::uint32_t max_context) {
-    // The qwen3.8-27b fleet NVFP4 artifact (qwen3_8_27b_nvfp4.ninfer) resolves to the 27B
-    // target with the nvfp4 weights profile (registry.cpp maps both qwen3.6/qwen3.8 27B model
-    // ids to target_key "qwen3_6_27b").
+    // The DFlash-augmented artifact (qwen3_8_27b_nvfp4.ninfer with the dflash/
+    // section) publishes under the nvfp4-dflash2 weights identity; the plain
+    // fleet image keeps nvfp4. package.cpp resolves both to the 27B target
+    // with the nvfp4 profile, but only the dflash build can reach this point:
+    // a fleet (1124-object) artifact fails the dflash bind before load
+    // summary exists.
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" || load.weights_id != "nvfp4" ||
+    if (load.target != "qwen3_6_27b" || load.weights_id != "nvfp4-dflash2" ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "DFlash Engine materialized an invalid artifact payload: target="
-                  << load.target << " weights=" << load.weights_id << '\n';
+                  << load.target << " weights=" << load.weights_id << " (expected nvfp4-dflash2)\n";
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();

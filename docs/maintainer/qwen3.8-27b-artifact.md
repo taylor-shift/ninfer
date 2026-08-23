@@ -2,8 +2,9 @@
 
 This reference defines the `qwen3.8-27b/nvfp4` `.ninfer` storage contract: identity, object
 inventory, shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
-source-to-object transforms. The existing registered `qwen3.8-27b/groupwise-int` contract remains
-defined in Section 13.
+source-to-object transforms. The DFlash-augmented image defined in Section 14 publishes under the
+`qwen3.8-27b/nvfp4-dflash2` weights identity. The existing registered `qwen3.8-27b/groupwise-int`
+contract remains defined in Section 13.
 
 The NVFP4 profile is a registered Engine identity implemented by the target converter, exact
 binder, and Qwen3.8 execution leaves. The generic artifact registry resolves its version-2
@@ -20,13 +21,20 @@ filename   = qwen3_8_27b_nvfp4.ninfer
 model_id   = qwen3.8-27b
 weights_id = nvfp4
 target_key = qwen3_8_27b
-recipe_id  = qwen3_8_27b_nvfp4-v1
+recipe_id  = qwen3.8-27b_nvfp4-v1
 ```
 
 The artifact is one complete image containing Text, the optimized MTP draft head, MTP, Vision, and
 six frontend resources. These components are not separate artifacts or selectable storage
 profiles. A runtime may choose not to materialize a supported component, but that does not change
 the artifact inventory or identity.
+
+The DFlash-augmented image of Section 14 appends the 66-object `dflash/` section to this
+inventory. Per the version-2 container evolution rule (artifact-container.md, Section 9) a
+changed full inventory under one model publishes under a new weights_id, so the augmented image
+carries the same fields with `weights_id = nvfp4-dflash2`. The 27B target registry resolves both
+identities to the same nvfp4 weights profile; the dflash tensor group's residency is selected by
+the Engine startup features in either case.
 
 The identity is read from the version-2 artifact directory. The filename, object count, and any
 representative tensor descriptor do not select the model or weights profile.
@@ -952,3 +960,10 @@ python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
   --dflash-model /path/to/Qwen3.8-27B-DFlash2 \
   --out out/qwen3_8_27b_nvfp4.ninfer
 ```
+
+Both builds write the same basename `qwen3_8_27b_nvfp4.ninfer`; the framing identity differs
+only in `weights_id` — `nvfp4` for the fleet image, `nvfp4-dflash2` for the augmented image
+(Section 1). The 27B target registry resolves both identities to the same nvfp4 weights
+profile. An Engine without the dflash startup feature still validates the `dflash/` section
+of the augmented image but materializes none of it; an Engine with the dflash feature
+requires the augmented image, because the dflash bind expects the 66-section inventory.

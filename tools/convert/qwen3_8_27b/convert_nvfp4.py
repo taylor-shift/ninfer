@@ -394,11 +394,18 @@ def build_conversion_report(
 
     The ``dflash/*`` section is recorded only when ``dflash_model_dir`` is
     given (together with the dflash preflight metadata); the no-flag report
-    is exactly the shared envelope.
+    is exactly the shared envelope. The report identity follows the artifact
+    identity: the DFlash-augmented build publishes under the
+    ``nvfp4-dflash2`` weights_id, the no-flag build under ``nvfp4``.
     """
 
+    weights_id = (
+        inventory.WEIGHTS_ID_DFLASH2
+        if dflash_model_dir is not None
+        else inventory.WEIGHTS_ID
+    )
     report = family_conversion.build_conversion_report(
-        identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        identity=ArtifactIdentity(inventory.MODEL_ID, weights_id),
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
         repo_root=_repo_root(),
@@ -513,8 +520,9 @@ def convert(
     """Run the closed dual-source conversion and return its report path.
 
     With ``dflash_dir`` set, the 66-object DFlash 2 section (``dflash/*``)
-    is appended after the registered objects; without it the artifact and
-    report are byte-for-byte identical to the no-flag build.
+    is appended after the registered objects and the image publishes under
+    the ``nvfp4-dflash2`` weights identity; without it the artifact and
+    report are byte-for-byte identical to the no-flag ``nvfp4`` build.
     """
 
     started = time.perf_counter()
@@ -541,6 +549,15 @@ def convert(
         flush=True,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
+    # The DFlash-augmented image publishes under the nvfp4-dflash2 weights_id
+    # (changed full inventory under one model -> new weights_id, per
+    # docs/maintainer/artifact-container.md Section 9); the no-flag image
+    # keeps the registered nvfp4 identity.
+    weights_id = (
+        inventory.WEIGHTS_ID_DFLASH2
+        if preflight.dflash_dir is not None
+        else inventory.WEIGHTS_ID
+    )
     resources = {resource.name: resource.data for resource in preflight.resources}
     draft_ids = draft_head.materialize_draft_head_token_ids(preflight.draft)
     derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_ids}
@@ -564,7 +581,7 @@ def convert(
     ) as quantized_reader:
         with ArtifactWriter(
             output,
-            ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+            ArtifactIdentity(inventory.MODEL_ID, weights_id),
             preflight.object_plan.specs,
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
