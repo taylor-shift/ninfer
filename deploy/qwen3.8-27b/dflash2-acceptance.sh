@@ -86,6 +86,18 @@ ensure_container() {
 
 # Count test binaries that ctest expects but the build tree does not have.
 # (Binaries land in /build/tests/<name>; a few in /build/<name>.)
+# Exact ctest test name for a unique substring (machine-derived;
+# the full target names are never typed by hand).
+ctest_name() {
+  cexec "cd /build && ctest -N 2>/dev/null" | sed -n 's/^ *Test *#[0-9]*: *//p' | grep -F "$1" | head -1
+}
+# ctest helpers taking the regex as an argument: keeps \"...2>/dev/null...\"
+# out of the same double-quoted string inside $( ) (a bash 5.2 parser bug
+# rejects that combination), and ctest -R exits 0 even when no test matches
+# — so ctest_count doubles as the no-match guard.
+ctest_count() { docker exec "$CONTAINER" bash -c "cd /build && ctest -N -R '$1' 2>/dev/null" | grep -c 'Test *#'; }
+ctest_run() { docker exec "$CONTAINER" bash -c "cd /build && ctest -R '$1' --output-on-failure"; }
+
 missing_test_binaries() {
   cexec "cd /build && out=\$(ctest -N 2>/dev/null | sed -n 's/^ *Test *#[0-9]*: *//p') && m=0 && n=0 && for t in \$out; do n=\$((n+1)); if [ ! -f tests/\$t ] && [ ! -f \$t ]; then m=\$((m+1)); fi; done; echo \"\$m/\$n\""
 }
@@ -247,8 +259,11 @@ fi
 
 # ---------- stage 2: CPU tests (no GPU, no artifact) ----------
 log "stage 2: CPU tests — linear dispatch shape coverage"
-if cexec "cd /build && ctest -R '^nin...linear_dispatch_test$' --output-on-failure"; then
-  ok "dispatch coverage PASS"
+DISPATCH_TEST=$(ctest_name 'linear_dispatch_test')
+if [ -z "$DISPATCH_TEST" ]; then
+  bad "linear_dispatch test not registered in ctest"; report "cpu dispatch coverage" "FAIL"
+elif [ "$(ctest_count "$DISPATCH_TEST")" -ge 1 ] && ctest_run "$DISPATCH_TEST"; then
+  ok "dispatch coverage PASS ($DISPATCH_TEST)"
   report "cpu dispatch coverage" "PASS"
 else
   bad "dispatch coverage FAILED (output above)"
@@ -257,19 +272,20 @@ fi
 
 # ---------- stage 3: GPU op unit tests ----------
 log "stage 3: GPU op unit tests (conv + selector)"
-OP_PAT='^(ninfer_grouped_dynamic_conv_test|nin...dflash_selector_test)$'
+CONV_TEST=$(ctest_name 'grouped_dynamic_conv_test')
+SEL_TEST=$(ctest_name 'dflash_selector_test')
+[ -n "$CONV_TEST" ] && [ -n "$SEL_TEST" ] || { bad "op tests not registered in ctest"; report "gpu op unit tests" "FAIL"; }
 run_op_tests() {
   if [ "$GPU_MODE" = docker ]; then
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
-      "$IMAGE" bash -c "cd /build && ctest -R '$OP_PAT' --output-on-failure"
+      "$IMAGE" bash -c "cd /build && ctest -R '^(${CONV_TEST}|${SEL_TEST})\$' --output-on-failure"
   else
-    extract_missing_libs "$BUILD/tests/ninfer_grouped_dynamic_conv_test" \
-                         "$BUILD/tests/ninfer_dflash_selector_test"
-    info "running ninfer_grouped_dynamic_conv_test (native) ..."
-    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./ninfer_grouped_dynamic_conv_test ) \
+    extract_missing_libs "$BUILD/tests/$CONV_TEST" "$BUILD/tests/$SEL_TEST"
+    info "running $CONV_TEST (native) ..."
+    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./"$CONV_TEST" ) \
       > /tmp/dflash2-opconv.log 2>&1; rc1=$?
-    info "running nin...dflash_selector_test (native) ..."
-    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./nin...dflash_selector_test ) \
+    info "running $SEL_TEST (native) ..."
+    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./"$SEL_TEST" ) \
       > /tmp/dflash2-opselector.log 2>&1; rc2=$?
     tail -3 /tmp/dflash2-opconv.log; tail -3 /tmp/dflash2-opselector.log
     [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]
@@ -286,6 +302,8 @@ fi
 # ---------- stage 4: artifact tests ----------
 log "stage 4: artifact tests (NINFER_QWEN3_8_27B_WEIGHTS)"
 ART_ENV="NINFER_QWEN3_8_27B_WEIGHTS=$ARTIFACT"
+LOAD_TEST=$(ctest_name 'qwen3_8_27b_dflash_load_plan_test')
+REAL_TEST=$(ctest_name 'qwen3_8_27b_dflash_real_test')
 run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
   local pat="$1" mode="$2" bin
   if [ "$mode" = docker ]; then
@@ -306,14 +324,14 @@ run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
 # 4a: load-plan (CPU-side binder; the dflash plan half needs the augmented
 #     artifact)
 if [ "$VARIANT" = augmented ]; then
-  if run_artifact_test '^nin...qwen3_8_27b_dflash_load_plan_test$' native; then
+  if run_artifact_test "$LOAD_TEST" native; then
     ok "load-plan PASS (1124 + 66 dflash objects, no full pool)"
     report "artifact load plan" "PASS"
   else
     bad "load-plan FAILED (augmented artifact — investigate)"; report "artifact load plan" "FAIL"
   fi
 else
-  out=$(run_artifact_test '^nin...qwen3_8_27b_dflash_load_plan_test$' native 2>&1)
+  out=$(run_artifact_test "$LOAD_TEST" native 2>&1)
   if [ $? -eq 0 ]; then
     ok "load-plan PASS"; report "artifact load plan" "PASS"
   else
@@ -330,9 +348,9 @@ fi
 # 4b: engine dflash real (GPU; dflash objects required)
 if [ "$VARIANT" = augmented ]; then
   if [ "$GPU_MODE" = docker ]; then
-    run_engine() { run_artifact_test '^nin...qwen3_8_27b_dflash_real_test$' docker; }
+    run_engine() { run_artifact_test "$REAL_TEST" docker; }
   else
-    run_engine() { run_artifact_test '^nin...qwen3_8_27b_dflash_real_test$' native; }
+    run_engine() { run_artifact_test "$REAL_TEST" native; }
   fi
   if run_engine; then
     ok "engine dflash real PASS (golden + D4 negative + determinism + long-restore)"
