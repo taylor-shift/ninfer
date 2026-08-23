@@ -269,7 +269,7 @@ else
   # One-time image bake: the GPU-mode docker runs (stages 3/4) need the apt
   # toolchain + libav* this container just installed; the base CUDA image lacks
   # them. Committing is cheap and idempotent (fresh layer diff).
-  if docker commit -q "$CONTAINER" "$FULL_IMAGE" >/dev/null 2>&1; then
+  if docker commit "$CONTAINER" "$FULL_IMAGE" >/dev/null 2>&1; then
     ok "committed $CONTAINER -> $FULL_IMAGE (test image for GPU-mode runs)"
   else
     warn "docker commit failed — GPU-mode runs will use the base image (apt libs missing)"
@@ -326,7 +326,11 @@ REAL_TEST=$(ctest_name 'qwen3_8_27b_dflash_real_test')
 run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
   local pat="$1" mode="$2" bin
   if [ "$mode" = docker ]; then
-    docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" -e "$ART_ENV" \
+    # The artifact lives on the WSL side; mount its directory and remap the
+    # env var to the in-container path (the WSL path does not exist there).
+    docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
+      -v "$(dirname "$ARTIFACT"):/artifacts" \
+      -e "NINFER_QWEN3_8_27B_WEIGHTS=/artifacts/$(basename "$ARTIFACT")" \
       "$(test_image)" bash -c "cd /build && ctest -R '$pat' --output-on-failure"
     return $?
   fi
