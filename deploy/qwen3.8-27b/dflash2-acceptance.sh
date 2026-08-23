@@ -37,8 +37,10 @@
 #                                   $REPO/.cuda13-libs.
 #
 # NOTE: the build runs inside the docker container. Ctrl-C at the terminal
-# kills the docker-exec client but NOT the in-container build; the script
-# detects that, verifies the actual binaries, and resumes ninja if needed.
+# kills the docker-exec client but NOT the in-container build. The gate judges
+# freshness by an idempotent ninja re-run (rc=0 only when fully up-to-date) —
+# "test binaries exist" is NOT proof of a fresh build: a failed ninja leaves
+# stale binaries on disk, and running those silently tests old code.
 # =============================================================================
 set -uo pipefail
 trap 'printf "\n[aborted — in-container build state may be partial; re-run to resume]\n"; exit 130' INT TERM
@@ -242,29 +244,35 @@ fi
 info "ninja -j$JOBS running; full build ~15-30 min, incremental ~1-5 min"
 info "live log: $BUILD/build.log   (WSL: tail -f $BUILD/build.log)"
 info "NOTE: Ctrl-C here kills the docker client, not the in-container build;"
-info "the script verifies the real binaries and resumes ninja if needed."
+info "the script proves the tree is up-to-date (idempotent ninja re-run) and"
+info "ABORTS if it is not — stale binaries must never test old code."
 build_rc=0
 cexec "cd /src && cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=OFF > /build/configure.log 2>&1 && ninja -C /build -j$JOBS > /build/build.log 2>&1" || build_rc=$?
-# The docker-exec client may have been killed (Ctrl-C) while the in-container
-# build kept running — or vice versa. Judge by the artifacts: every test
-# binary ctest expects must exist; if not, resume ninja (idempotent).
-missing=$(missing_test_binaries)
-if [ "${missing%%/*}" != "0" ]; then
-  warn "build incomplete: $missing test binaries missing (client/interrupt or slow link)"
-  warn "resuming ninja (idempotent) ..."
-  cexec "cd /src && ninja -C /build -j$JOBS >> /build/build.log 2>&1" || true
-  sleep 2
-  missing=$(missing_test_binaries)
+# The docker-exec client may be killed (Ctrl-C) while the in-container build
+# keeps running — and a FAILED ninja leaves older test binaries on disk, so
+# "binaries present" is NOT evidence of a fresh build (that gate once let
+# stale binaries silently test old code while ninja rc=1 went unreported).
+# Oracle: an idempotent ninja re-run returns 0 only when the tree is fully
+# up-to-date — and it resumes/finishes an interrupted build.
+if cexec "pgrep -f '[n]inja -C /build' >/dev/null" 2>/dev/null; then
+  warn "build still running in container (client interrupted); waiting for it ..."
+  for _ in $(seq 1 360); do
+    cexec "pgrep -f '[n]inja -C /build' >/dev/null" 2>/dev/null || break
+    sleep 10
+  done
 fi
+final_rc=0
+cexec "cd /src && ninja -C /build -j$JOBS >> /build/build.log 2>&1" || final_rc=$?
+missing=$(missing_test_binaries)
 missing_n=${missing%%/*}
 missing_t=${missing#*/}
-if [ "$missing_n" != "0" ]; then
-  bad "build FAILED: $missing_n/$missing_t test binaries still missing"
-  cexec "tail -20 /build/build.log" || true
+if [ "$final_rc" != "0" ] || [ "$missing_n" != "0" ]; then
+  bad "build FAILED (ninja re-run rc=$final_rc; first pass rc=$build_rc; binaries missing: $missing_n/$missing_t)"
+  bad "aborting: running stale test binaries would silently test old code"
+  cexec "grep -B3 -A10 -iE 'error|FAILED' /build/build.log | tail -60" || true
   report "build" "FAIL"
 else
-  ok "build verified: all $missing_t test binaries present (ninja client rc=$build_rc, log: $BUILD/build.log)"
-  cexec "tail -2 /build/build.log" || true
+  ok "build verified FRESH: ninja up-to-date re-run rc=0 (first pass rc=$build_rc), all $missing_t test binaries present (log: $BUILD/build.log)"
   report "build" "PASS"
   # One-time image bake: the GPU-mode docker runs (stages 3/4) need the apt
   # toolchain + libav* this container just installed; the base CUDA image lacks
