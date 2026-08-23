@@ -5,16 +5,18 @@
 // BF16 values the kernel reads, under the engine layout law (element (r, c) of a contiguous
 // [R, C] tensor at c*R + r, first dimension fastest):
 //
-//   hidden   [5120, C]     element (c, t) at t*5120 + c
-//   dynamic  [640, C]      element (g, t) at t*640 + g (rows 0..319 = tap 0, 320..639 = tap 1)
-//   base     [2, 2, 5120]  element (use, tap, ch) at use + tap*2 + ch*4
-//   out      [5120, C]     element (c, t) at t*5120 + c
+//   hidden   [5120, C]      element (c, t) at t*5120 + c
+//   dynamic  [1280, C]      element (row, t) at t*1280 + row — the FULL kernel_projection
+//                           GEMM output holding both uses: use u owns rows [u*640, u*640+640)
+//                           (rows 0..319 / 640..959 = tap 0, 320..639 / 960..1279 = tap 1)
+//   base     [2, 2, 5120]   element (use, tap, ch) at use + tap*2 + ch*4
+//   out      [5120, C]      element (c, t) at t*5120 + c
 //
 // with C = (k+1)*B batch-major block columns (column m = b*(k+1) + d) and, for every channel c
 // and column t:
 //
-//   out[t,c] = (base[use,0,c] + dyn[t, c/16])         * x[t,c]
-//            + (base[use,1,c] + dyn[t, 320 + c/16])   * x[t-1,c],
+//   out[t,c] = (base[use,0,c] + dyn[t, use*640 + c/16])         * x[t,c]
+//            + (base[use,1,c] + dyn[t, use*640 + 320 + c/16])   * x[t-1,c],
 //
 // where x[t-1,c] is read as zero at every row anchor (t % width == 0, width = C/B, including
 // t = 0): each batch row is an independent block-diffusion sequence and the conv never wraps
@@ -43,7 +45,8 @@ namespace {
 
 constexpr std::int32_t kChannels = 5120;
 constexpr std::int32_t kGroups   = 320;
-constexpr std::int32_t kDynRows  = 640;
+constexpr std::int32_t kUseRows  = 640;  // rows per use (two taps x 320 groups)
+constexpr std::int32_t kDynRows  = 2 * kUseRows;  // 1280: full dynamic, column stride
 constexpr std::int32_t kUses     = 2;
 constexpr std::int32_t kTaps     = 2;
 
@@ -57,8 +60,9 @@ std::size_t hidden_offset(std::int32_t c, std::int32_t t) {
     return static_cast<std::size_t>(t) * kChannels + static_cast<std::size_t>(c);
 }
 
-std::size_t dyn_offset(std::int32_t g, std::int32_t t) {
-    return static_cast<std::size_t>(t) * kDynRows + static_cast<std::size_t>(g);
+std::size_t dyn_offset(std::int32_t use, std::int32_t g, std::int32_t t) {
+    return static_cast<std::size_t>(t) * kDynRows +
+           static_cast<std::size_t>(use) * kUseRows + static_cast<std::size_t>(g);
 }
 
 std::size_t base_offset(std::int32_t use, std::int32_t tap, std::int32_t c) {
@@ -79,9 +83,9 @@ std::vector<double> conv_oracle(const std::vector<float>& hidden,
             const double x_prev =
                 (t % width == 0) ? 0.0 : static_cast<double>(hidden[hidden_offset(c, t - 1)]);
             const double tap0 = static_cast<double>(base[base_offset(use, 0, c)]) +
-                                static_cast<double>(dynamic[dyn_offset(g, t)]);
+                                static_cast<double>(dynamic[dyn_offset(use, g, t)]);
             const double tap1 = static_cast<double>(base[base_offset(use, 1, c)]) +
-                                static_cast<double>(dynamic[dyn_offset(kGroups + g, t)]);
+                                static_cast<double>(dynamic[dyn_offset(use, kGroups + g, t)]);
             expected[hidden_offset(c, t)] = tap0 * x_cur + tap1 * x_prev;
         }
     }
@@ -98,7 +102,7 @@ bool anchor_term_exercised(const std::vector<float>& hidden, const std::vector<f
         for (std::int32_t c = 0; c < kChannels; ++c) {
             const std::int32_t g = c / 16;
             const double term = (static_cast<double>(base[base_offset(use, 1, c)]) +
-                                 static_cast<double>(dynamic[dyn_offset(kGroups + g, t)])) *
+                                 static_cast<double>(dynamic[dyn_offset(use, kGroups + g, t)])) *
                                 static_cast<double>(hidden[hidden_offset(c, t - 1)]);
             max_term = std::max(max_term, std::abs(term));
         }
@@ -115,7 +119,16 @@ int run_case(std::int32_t columns, std::int32_t batch, std::int32_t use, std::ui
     std::vector<float> dynamic(static_cast<std::size_t>(kDynRows) * columns);
     std::vector<float> base(static_cast<std::size_t>(kUses) * kTaps * kChannels);
     fill_uniform(hidden, seed, -4.0f, 4.0f);
+    // The two use halves (rows [0:640) and [640:1280)) carry DIFFERENT values, so a kernel
+    // that ignores the use row offset (or strides columns by 640 instead of 1280) misses
+    // the reference for both uses.
     fill_uniform(dynamic, seed + 1u, -2.0f, 2.0f);
+    {
+        std::vector<float> use1_half(static_cast<std::size_t>(kUseRows) * columns);
+        fill_uniform(use1_half, seed + 9u, -2.0f, 2.0f);
+        std::copy(use1_half.begin(), use1_half.end(),
+                  dynamic.begin() + static_cast<std::size_t>(kUseRows) * columns);
+    }
     fill_uniform(base, seed + 2u, -2.0f, 2.0f);
     round_to_bf16(hidden);
     round_to_bf16(dynamic);
@@ -261,6 +274,17 @@ int rejection_cases() {
         },
         "grouped_dynamic_causal_conv rejection hidden non-contiguous",
         "grouped_dynamic_causal_conv: hidden must be a contiguous BF16 matrix");
+    // The old per-use 640-row slice is no longer a valid dynamic: the op takes the FULL
+    // 1280-row kernel_projection output (the kernel strides by 1280 and offsets use*640).
+    failures += expect_invalid_argument(
+        [&] {
+            GuardedDeviceBuffer use_slice_buf(static_cast<std::size_t>(kUseRows) * columns * 2);
+            use_slice_buf.fill(0x99);
+            Tensor use_slice(use_slice_buf.data(), DType::BF16, {kUseRows, columns});
+            ops::grouped_dynamic_causal_conv(hidden, use_slice, base, out, 0, batch, nullptr);
+        },
+        "grouped_dynamic_causal_conv rejection dynamic 640-row use slice",
+        "grouped_dynamic_causal_conv: dynamic must be a contiguous BF16 matrix");
     failures += expect_invalid_argument(
         [&] {
             Tensor out_alias(hidden_buf.data(), DType::BF16, {kChannels, columns});

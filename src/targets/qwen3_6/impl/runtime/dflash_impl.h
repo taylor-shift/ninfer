@@ -242,16 +242,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 if constexpr (Config::conv_kernel_size > 0) {
                     // DFlash 2 attention-side conv: dyn = linear(h0, attention_conv.
                     // kernel_projection) -> [2*conv_kernel_size*(hidden/conv_group_size),
-                    // columns] (the two tap use-slices); h1 = grouped_dynamic_causal_conv(h0,
-                    // dyn.use0, base_kernel.use0). The conv runs over ALL block columns, the
-                    // anchor at t=0 included (zero-padded there).
-                    const std::int32_t dynamic_rows =
-                        Config::conv_kernel_size * (Config::hidden / Config::conv_group_size);
+                    // columns]; the conv runs over ALL block columns, the anchor at t=0
+                    // included (zero-padded there). h1 = grouped_dynamic_causal_conv(h0,
+                    // dyn, base_kernel, use=0): use selects the 640-row dynamic window and
+                    // the base [2,2,5120] use half.
                     ops::linear(roots.hidden, weight.attention_conv.kernel_projection,
                                 conv_roots.attention_dynamic, state.execution.device.stream);
                     attention_input = conv_roots.attention_out;
                     ops::grouped_dynamic_causal_conv(
-                        roots.hidden, conv_roots.attention_dynamic.slice(0, 0, dynamic_rows),
+                        roots.hidden, conv_roots.attention_dynamic,
                         weight.attention_conv.base_kernel, attention_input, 0, batch_size,
                         state.execution.device.stream);
                 }
@@ -296,18 +295,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 if constexpr (Config::conv_kernel_size > 0) {
                     // DFlash 2: the fused linear_add is unfused under conv_kernel_size > 0:
                     // attn_o = linear(A, attention_output); fin = grouped_dynamic_causal_conv(
-                    // attn_o, dyn.use1, base_kernel.use1) into the shared conv-out buffer (h1 is
+                    // attn_o, dyn, base_kernel, use=1) into the shared conv-out buffer (h1 is
                     // fully consumed by the attention before fin is written); residual += fin.
-                    const std::int32_t dynamic_rows =
-                        Config::conv_kernel_size * (Config::hidden / Config::conv_group_size);
                     Tensor attention_output =
                         state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
                     ops::linear(roots.attention.view({Config::query_size, columns}),
                                 weight.attention_output, attention_output,
                                 state.execution.device.stream);
                     ops::grouped_dynamic_causal_conv(
-                        attention_output,
-                        conv_roots.attention_dynamic.slice(0, dynamic_rows, dynamic_rows),
+                        attention_output, conv_roots.attention_dynamic,
                         weight.attention_conv.base_kernel, conv_roots.attention_out, 1,
                         batch_size, state.execution.device.stream);
                     ops::residual_add(conv_roots.attention_out, residual,
@@ -326,14 +322,12 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 Tensor mlp_input = roots.hidden;
                 if constexpr (Config::conv_kernel_size > 0) {
                     // DFlash 2 mlp-side conv: dyn2 = linear(h2, mlp_conv.kernel_projection);
-                    // h3 = grouped_dynamic_causal_conv(h2, dyn2.use0, mlp base.use0).
-                    const std::int32_t dynamic_rows =
-                        Config::conv_kernel_size * (Config::hidden / Config::conv_group_size);
+                    // h3 = grouped_dynamic_causal_conv(h2, dyn2, mlp base, use=0).
                     ops::linear(roots.hidden, weight.mlp_conv.kernel_projection,
                                 conv_roots.mlp_dynamic, state.execution.device.stream);
                     mlp_input = conv_roots.mlp_out;
                     ops::grouped_dynamic_causal_conv(
-                        roots.hidden, conv_roots.mlp_dynamic.slice(0, 0, dynamic_rows),
+                        roots.hidden, conv_roots.mlp_dynamic,
                         weight.mlp_conv.base_kernel, mlp_input, 0, batch_size,
                         state.execution.device.stream);
                 }
@@ -354,16 +348,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                 }
                 if constexpr (Config::conv_kernel_size > 0) {
                     // DFlash 2: mlp_o = linear(inter, down); fin2 = grouped_dynamic_causal_conv(
-                    // mlp_o, dyn2.use1, mlp base.use1) into the shared conv-out buffer;
+                    // mlp_o, dyn2, mlp base, use=1) into the shared conv-out buffer;
                     // residual += fin2.
-                    const std::int32_t dynamic_rows =
-                        Config::conv_kernel_size * (Config::hidden / Config::conv_group_size);
                     Tensor mlp_output =
                         state.execution.work.alloc(DType::BF16, {Config::hidden, columns});
                     ops::linear(roots.intermediate, weight.down, mlp_output,
                                 state.execution.device.stream);
                     ops::grouped_dynamic_causal_conv(
-                        mlp_output, conv_roots.mlp_dynamic.slice(0, dynamic_rows, dynamic_rows),
+                        mlp_output, conv_roots.mlp_dynamic,
                         weight.mlp_conv.base_kernel, conv_roots.mlp_out, 1, batch_size,
                         state.execution.device.stream);
                     ops::residual_add(conv_roots.mlp_out, residual,

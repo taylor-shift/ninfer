@@ -10,10 +10,13 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kChannels    = 5120;
-constexpr std::int32_t kDynamicRows = 640;
-constexpr std::int32_t kUses        = 2;
-constexpr std::int32_t kTaps        = 2;
+constexpr std::int32_t kChannels = 5120;
+constexpr std::int32_t kGroups   = 320;  // channels per correction group (5120 / 16)
+constexpr std::int32_t kUses     = 2;
+constexpr std::int32_t kTaps     = 2;
+// The full kernel_projection GEMM output holds BOTH uses: kUses x (kTaps x kGroups) = 1280 rows.
+// The kernel strides columns by kDynamicRows and selects use u's 640-row window.
+constexpr std::int32_t kDynamicRows = kUses * kTaps * kGroups;
 
 // Registered domain: C = (k+1)*B for k in 1..7 draft tokens and B in 1..8 batch rows — the exact
 // 29-value subset of 2..64, never the whole interval (for example 11 and 13 are absent).

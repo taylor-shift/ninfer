@@ -313,6 +313,17 @@ sanitize_test() { # $1=binary name $2=timeout-seconds [$3...=extra docker run fl
     info "sanitizer auto-run needs mode A (docker --gpus); native mode: run dflash2-sanitize.sh"
     return 0
   fi
+  # A host-side throw (wrapper validation, layout check) produces NO device fault: the
+  # memcheck re-run takes ~10x longer and only re-throws the same exception (the hang behind
+  # "It hung, it wouldn't quit"). Skip the sanitizer and surface the throw instead.
+  local log
+  for log in /tmp/dflash2-ctest.log /tmp/dflash2-opdocker.log; do
+    if [ -s "$log" ] && grep -q "terminate called after throwing" "$log"; then
+      warn "$name failed with a HOST-side exception (no device fault) — compute-sanitizer SKIPPED ($log):"
+      grep -m1 "terminate called after throwing" "$log" | sed 's/^/    /'
+      return 0
+    fi
+  done
   warn "auto-diagnosing $name under compute-sanitizer (timeout ${secs}s) ..."
   timeout "$secs" docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
     -e NINFER_LOG_OPS=1 \
@@ -374,8 +385,11 @@ run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
       -v "$(dirname "$ARTIFACT"):/artifacts" \
       -e "NINFER_QWEN3_8_27B_WEIGHTS=/artifacts/$(basename "$ARTIFACT")" \
       -e NINFER_LOG_OPS=1 \
-      "$(test_image)" bash -c "cd /build && ctest -R '$pat' --output-on-failure"
-    return $?
+      "$(test_image)" bash -c "cd /build && ctest -R '$pat' --output-on-failure" \
+      > /tmp/dflash2-ctest.log 2>&1
+    local rc=$?
+    cat /tmp/dflash2-ctest.log
+    return $rc
   fi
   # For these registrations the ctest test name is the binary name; strip the
   # regex decoration (^ $ ( ) |) to get it.
