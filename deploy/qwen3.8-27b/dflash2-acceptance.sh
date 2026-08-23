@@ -6,18 +6,19 @@
 #   0  preflight   GPU, repo state, artifact + variant detection, docker,
 #                  docker-GPU capability (falls back to native mode)
 #   1  build       full engine build in the CUDA 13.1.2 container (CPU-only;
-#                  the container needs no GPU flag to compile)
+#                  the container needs no GPU flag to compile) — verified by
+#                  the actual test binaries, not the exit code alone
 #   2  CPU tests   linear dispatch shape-coverage (no GPU, no artifact)
 #   3  GPU op tests  grouped_dynamic_conv + dflash_selector unit tests —
 #                  the layout-law kernels vs independent CPU references
 #   4  artifact tests  dflash load-plan (1124 + 66 object plans) and engine
 #                  dflash real (golden / D4 negative / determinism /
 #                  long-restore) — the dflash parts need the AUGMENTED
-#                  artifact (built with --dflash-model); see the note printed
-#                  at the end for the exact converter command.
+#                  artifact (built with --dflash-model)
 #
 # Usage:
 #   dflash2-27b-acceptance.sh [artifact.ninfer] [--install-gpu-toolkit]
+#                             [--allow-busy-gpu]
 #
 # Defaults:
 #   REPO      $NINFER_REPO or /mnt/f/ninfer-fork   (branch dflash2-27b)
@@ -32,9 +33,15 @@
 #   B) native fallback            — test binaries are executed directly in WSL
 #                                   (which exposes /dev/nvidia*) with the
 #                                   container's CUDA 13.1 runtime libraries,
-#                                   extracted once to $REPO/.cuda13-libs.
+#                                   extracted once (only the missing ones) to
+#                                   $REPO/.cuda13-libs.
+#
+# NOTE: the build runs inside the docker container. Ctrl-C at the terminal
+# kills the docker-exec client but NOT the in-container build; the script
+# detects that, verifies the actual binaries, and resumes ninja if needed.
 # =============================================================================
 set -uo pipefail
+trap 'printf "\n[aborted — in-container build state may be partial; re-run to resume]\n"; exit 130' INT TERM
 
 # ---------- arguments ----------
 ARTIFACT=""
@@ -60,10 +67,11 @@ log()  { printf '\n================== %s ==================\n' "$*"; }
 ok()   { printf '  [ok]   %s\n' "$*"; }
 bad()  { printf '  [FAIL] %s\n' "$*"; }
 warn() { printf '  [warn] %s\n' "$*"; }
+info() { printf '  [..]   %s\n' "$*" >&2; }
 skip() { printf '  [skip] %s\n' "$*"; }
 
 RESULTS=()
-report() { RESULTS+=("$(printf '%-28s %s' "$1" "$2")"); }
+report() { RESULTS+=("$(printf '%-30s %s' "$1" "$2")"); }
 
 # container helpers (build container: no GPU flag needed to compile)
 cexec() { docker exec "$CONTAINER" bash -c "$1"; }
@@ -76,6 +84,27 @@ ensure_container() {
   fi
 }
 
+# Count test binaries that ctest expects but the build tree does not have.
+# (Binaries land in /build/tests/<name>; a few in /build/<name>.)
+missing_test_binaries() {
+  cexec "cd /build && out=\$(ctest -N 2>/dev/null | sed -n 's/^ *Test *#[0-9]*: *//p') && m=0 && n=0 && for t in \$out; do n=\$((n+1)); if [ ! -f tests/\$t ] && [ ! -f \$t ]; then m=\$((m+1)); fi; done; echo \"\$m/\$n\""
+}
+
+# Extract only the shared libraries the WSL host is missing (per ldd),
+# one docker run per library, entrypoint-overridden (no image banner).
+extract_missing_libs() { # $@ = test binary paths (WSL-side)
+  for bin in "$@"; do
+    [ -x "$bin" ] || continue
+    for lib in $(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}'); do
+      [ -f "$CUDA13LIBS/$lib" ] && continue
+      info "extracting $lib from the image (one-time) ..."
+      docker run --rm --entrypoint bash -v "$CUDA13LIBS:/out" "$IMAGE" \
+        -c "f=\$(find /usr/local/cuda /usr/lib /lib -name '$lib' -not -name '*stubs*' 2>/dev/null | head -1); [ -n \"\$f\" ] && cp -L \"\$f\" /out/ || exit 1" \
+        || warn "could not extract $lib — GPU tests may fail to load"
+    done
+  done
+}
+
 # ---------- stage 0: preflight ----------
 log "stage 0: preflight"
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -83,9 +112,9 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 else
   bad "nvidia-smi missing in WSL — is the Windows NVIDIA driver up to date?"; exit 1
 fi
-# SAFETY GATE: this 5090 may be serving the live inference instance that this
-# session runs on. Refuse to run (any stage) while something owns the GPU
-# unless explicitly overridden — the GPU tests would OOM/kill that instance.
+# SAFETY GATE: this 5090 may be serving the live inference instance. Refuse
+# to run (any stage) while something owns the GPU unless overridden — the
+# GPU tests would OOM/kill that instance.
 gpu_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
 if [ "${gpu_used:-0}" -gt 4096 ] && [ "$ALLOW_BUSY_GPU" != 1 ]; then
   bad "GPU is busy: ${gpu_used} MiB in use (the serving inference instance is probably running there)"
@@ -183,60 +212,66 @@ log "stage 1: build (container, CPU-only)"
 ensure_container
 cexec 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq --no-install-recommends cmake ninja-build pkg-config python3 python3-dev libavcodec-dev libavformat-dev libavutil-dev libcurl4-openssl-dev libswscale-dev 2>&1 | tail -1'
 if [ -f "$BUILD/CMakeCache.txt" ] && [ -f "$BUILD/build.ninja" ]; then
-  ok "incremental build"
+  ok "incremental build (existing build tree)"
 else
   ok "full configure + build"
 fi
-if cexec "cd /src && cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=OFF > /build/configure.log 2>&1 && ninja -C /build -j$JOBS > /build/build.log 2>&1"; then
-  ok "build OK"
-  report "build" "PASS"
-else
-  bad "build FAILED — tail of /build/build.log:"
-  docker exec "$CONTAINER" tail -30 /build/build.log
+info "ninja -j$JOBS running; full build ~15-30 min, incremental ~1-5 min"
+info "live log: $BUILD/build.log   (WSL: tail -f $BUILD/build.log)"
+info "NOTE: Ctrl-C here kills the docker client, not the in-container build;"
+info "the script verifies the real binaries and resumes ninja if needed."
+build_rc=0
+cexec "cd /src && cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=OFF > /build/configure.log 2>&1 && ninja -C /build -j$JOBS > /build/build.log 2>&1" || build_rc=$?
+# The docker-exec client may have been killed (Ctrl-C) while the in-container
+# build kept running — or vice versa. Judge by the artifacts: every test
+# binary ctest expects must exist; if not, resume ninja (idempotent).
+missing=$(missing_test_binaries)
+if [ "${missing%%/*}" != "0" ]; then
+  warn "build incomplete: $missing test binaries missing (client/interrupt or slow link)"
+  warn "resuming ninja (idempotent) ..."
+  cexec "cd /src && ninja -C /build -j$JOBS >> /build/build.log 2>&1" || true
+  sleep 2
+  missing=$(missing_test_binaries)
+fi
+missing_n=${missing%%/*}
+missing_t=${missing#*/}
+if [ "$missing_n" != "0" ]; then
+  bad "build FAILED: $missing_n/$missing_t test binaries still missing"
+  cexec "tail -20 /build/build.log" || true
   report "build" "FAIL"
-  printf '\n================== SUMMARY ==================\n'
-  printf '%s\n' "${RESULTS[@]}"
-  exit 1
+else
+  ok "build verified: all $missing_t test binaries present (ninja client rc=$build_rc, log: $BUILD/build.log)"
+  cexec "tail -2 /build/build.log" || true
+  report "build" "PASS"
 fi
 
 # ---------- stage 2: CPU tests (no GPU, no artifact) ----------
 log "stage 2: CPU tests — linear dispatch shape coverage"
-if cexec "cd /build && ctest -R '^ninfer_linear_dispatch_test$' --output-on-failure" > /tmp/dflash2-dispatch.log 2>&1; then
-  ok "dispatch coverage PASS (see /tmp/dflash2-dispatch.log)"
+if cexec "cd /build && ctest -R '^nin...linear_dispatch_test$' --output-on-failure"; then
+  ok "dispatch coverage PASS"
   report "cpu dispatch coverage" "PASS"
 else
-  bad "dispatch coverage FAILED — tail:"; tail -25 /tmp/dflash2-dispatch.log
+  bad "dispatch coverage FAILED (output above)"
   report "cpu dispatch coverage" "FAIL"
 fi
 
 # ---------- stage 3: GPU op unit tests ----------
 log "stage 3: GPU op unit tests (conv + selector)"
-OP_PAT='^(ninfer_grouped_dynamic_conv_test|ninfer_dflash_selector_test)$'
+OP_PAT='^(ninfer_grouped_dynamic_conv_test|nin...dflash_selector_test)$'
 run_op_tests() {
   if [ "$GPU_MODE" = docker ]; then
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
       "$IMAGE" bash -c "cd /build && ctest -R '$OP_PAT' --output-on-failure"
   else
-    # native: make sure the CUDA 13.1 runtime libs the binaries need are available
-    if [ ! -d "$CUDA13LIBS" ]; then
-      mkdir -p "$CUDA13LIBS"
-      warn "extracting CUDA 13.1 runtime libs from the image (one-time) ..."
-      docker run --rm -v "$CUDA13LIBS:/out" "$IMAGE" \
-        bash -c "cp -L /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/libcublas.so* /usr/local/cuda/lib64/libcufft.so* /usr/local/cuda/lib64/libcurand.so* /usr/local/cuda/lib64/libcudnn*.so* /usr/local/cuda/lib64/libcusolver.so* /usr/local/cuda/lib64/libcusparse.so* /usr/local/cuda/lib64/libnvrtc*.so* /out/ 2>/dev/null; true"
-    fi
-    # fill any remaining missing libs the linker wants
-    for bin in "$BUILD"/tests/ninfer_grouped_dynamic_conv_test "$BUILD"/tests/ninfer_dflash_selector_test; do
-      [ -x "$bin" ] || continue
-      for lib in $(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}'); do
-        [ -f "$CUDA13LIBS/$lib" ] || docker run --rm -v "$CUDA13LIBS:/out" "$IMAGE" \
-          bash -c "find /usr/local/cuda /usr/lib -name '$lib' | head -1 | xargs -r cp -L /out/"
-      done
-    done
+    extract_missing_libs "$BUILD/tests/ninfer_grouped_dynamic_conv_test" \
+                         "$BUILD/tests/ninfer_dflash_selector_test"
+    info "running ninfer_grouped_dynamic_conv_test (native) ..."
     ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./ninfer_grouped_dynamic_conv_test ) \
       > /tmp/dflash2-opconv.log 2>&1; rc1=$?
-    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./ninfer_dflash_selector_test ) \
+    info "running nin...dflash_selector_test (native) ..."
+    ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./nin...dflash_selector_test ) \
       > /tmp/dflash2-opselector.log 2>&1; rc2=$?
-    tail -5 /tmp/dflash2-opconv.log; tail -5 /tmp/dflash2-opselector.log
+    tail -3 /tmp/dflash2-opconv.log; tail -3 /tmp/dflash2-opselector.log
     [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]
   fi
 }
@@ -251,32 +286,35 @@ fi
 # ---------- stage 4: artifact tests ----------
 log "stage 4: artifact tests (NINFER_QWEN3_8_27B_WEIGHTS)"
 ART_ENV="NINFER_QWEN3_8_27B_WEIGHTS=$ARTIFACT"
-run_artifact_test() { # $1=ctest regex $2=mode-force(docker|native|auto)
-  local pat="$1" mode="${2:-$GPU_MODE}" out
+run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
+  local pat="$1" mode="$2" bin
   if [ "$mode" = docker ]; then
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" -e "$ART_ENV" \
       "$IMAGE" bash -c "cd /build && ctest -R '$pat' --output-on-failure"
-  else
-    local bin
-    bin=$(docker exec "$CONTAINER" bash -c "cd /build && ctest -N -R '$pat' 2>/dev/null | grep -oP '(?<=Test #\d+ : ).*' | head -1")
-    [ -n "$bin" ] || { warn "no binary resolved for '$pat'"; return 1; }
-    out="$BUILD/tests/$bin"
-    [ -x "$out" ] || out="$BUILD/$bin"
-    if [ ! -x "$out" ]; then warn "binary for '$pat' not found under /build"; return 1; fi
-    ( cd "$(dirname "$out")" && env "$ART_ENV" LD_LIBRARY_PATH="$CUDA13LIBS" "./$(basename "$out")" )
+    return $?
   fi
+  # For these registrations the ctest test name is the binary name; strip the
+  # regex decoration (^ $ ( ) |) to get it.
+  bin=$(echo "$pat" | sed -e 's/^\^//' -e 's/\$$//' -e 's/[()|]//g' -e 's/\$//g')
+  local out="$BUILD/tests/$bin"
+  [ -x "$out" ] || out="$BUILD/$bin"
+  if [ ! -x "$out" ]; then warn "binary for '$pat' not found under $BUILD"; return 1; fi
+  extract_missing_libs "$out"
+  info "running $bin (native, artifact: $ARTIFACT) ..."
+  ( cd "$(dirname "$out")" && env "$ART_ENV" LD_LIBRARY_PATH="$CUDA13LIBS" "./$(basename "$out")" )
 }
-# 4a: load-plan (CPU-side binder; works in either mode; the dflash plan half
-#     needs the augmented artifact)
+# 4a: load-plan (CPU-side binder; the dflash plan half needs the augmented
+#     artifact)
 if [ "$VARIANT" = augmented ]; then
-  if run_artifact_test '^ninfer_qwen3_8_27b_dflash_load_plan_test$' native; then
+  if run_artifact_test '^nin...qwen3_8_27b_dflash_load_plan_test$' native; then
     ok "load-plan PASS (1124 + 66 dflash objects, no full pool)"
     report "artifact load plan" "PASS"
   else
     bad "load-plan FAILED (augmented artifact — investigate)"; report "artifact load plan" "FAIL"
   fi
 else
-  if out=$(run_artifact_test '^ninfer_qwen3_8_27b_dflash_load_plan_test$' native 2>&1); then
+  out=$(run_artifact_test '^nin...qwen3_8_27b_dflash_load_plan_test$' native 2>&1)
+  if [ $? -eq 0 ]; then
     ok "load-plan PASS"; report "artifact load plan" "PASS"
   else
     if grep -q "1124" <<<"$out"; then
@@ -291,7 +329,12 @@ else
 fi
 # 4b: engine dflash real (GPU; dflash objects required)
 if [ "$VARIANT" = augmented ]; then
-  if run_artifact_test '^ninfer_qwen3_8_27b_dflash_real_test$' docker; then
+  if [ "$GPU_MODE" = docker ]; then
+    run_engine() { run_artifact_test '^nin...qwen3_8_27b_dflash_real_test$' docker; }
+  else
+    run_engine() { run_artifact_test '^nin...qwen3_8_27b_dflash_real_test$' native; }
+  fi
+  if run_engine; then
     ok "engine dflash real PASS (golden + D4 negative + determinism + long-restore)"
     report "engine dflash real" "PASS"
   else
@@ -308,13 +351,11 @@ printf '%s\n' "${RESULTS[@]}"
 printf '\n----------------------------------------------\n'
 if [ "$VARIANT" = fleet ]; then
 cat <<'NOTE'
-The dflash-augmented artifact (1190 objects) is built by the converter in
-tools/convert/qwen3_8_27b/convert_nvfp4.py from the fixed sources:
-  --model          Qwen/Qwen3.8-27B          @ 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0  (base-hf-bf16)
-  --quantized-model unsloth/Qwen3.8-27B-NVFP4 @ 60e813d4dbbdc5d64cf3f5a8caf2897bedf03679 (vllm-nvfp4-fp8)
-  --dflash-model   z-lab/Qwen3.8-27B-DFlash2  @ 50307d4c4cde6860d4eee73e2547cd786fe8e8a4 (config.json + model.safetensors)
-(both gated repos need an HF token with license acceptance; then re-run this
-script with the augmented artifact path as the first argument.)
+The dflash-augmented artifact (1190 objects) is published at
+  https://huggingface.co/phaseonx11/Qwen3.8-27B-nvfp4-DFlash2-NInfer
+(qwen3_8_27b_nvfp4.ninfer, sha256 6cc7560ae3427d8fa87b75c17e41328116b71b068c4c4dc06137fb73b656f64e)
+or built with the converter's --dflash-model (see docs §14). Re-run this
+script with the augmented artifact path as the first argument.
 NOTE
 fi
 fails=0
