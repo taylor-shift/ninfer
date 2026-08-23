@@ -497,7 +497,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     } else {
                         scratch(layout, ops::linear_workspace_capacity_bytes(
                                             QType::W8G32_F16S, DFlashConfig::hidden,
-                                            DFlashConfig::query_size, LinearPolicy::A16Only,
+                                            DFlashConfig::query_size, ops::LinearPolicy::A16Only,
                                             tokens, tokens));
                     }
                 }
@@ -519,11 +519,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         // linear down around the second grouped dynamic conv.
                         scratch(layout, ops::linear_workspace_capacity_bytes(
                                             QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                            DFlashConfig::hidden, LinearPolicy::A16Only,
+                                            DFlashConfig::hidden, ops::LinearPolicy::A16Only,
                                             tokens, tokens));
                         scratch(layout, ops::linear_workspace_capacity_bytes(
                                             QType::W8G32_F16S, DFlashConfig::hidden,
-                                            DFlashConfig::intermediate, LinearPolicy::A16Only,
+                                            DFlashConfig::intermediate, ops::LinearPolicy::A16Only,
                                             tokens, tokens));
                     }
                 }
