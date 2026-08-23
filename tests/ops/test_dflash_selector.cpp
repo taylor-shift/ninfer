@@ -178,8 +178,10 @@ int run_topk() {
     Tensor logits_tensor(device_logits.data(), DType::BF16, {kVocab, kTopkColumns});
     Tensor candidates_tensor(device_candidates.data(), DType::I32, {kTopK, kTopkColumns});
     Tensor unary_tensor(device_unary.data(), DType::FP32, {kTopK, kTopkColumns});
+    std::cout << "[phase] topk: launching" << std::endl;
     ops::dflash_selector_topk(logits_tensor, candidates_tensor, unary_tensor, nullptr);
     cuda_synchronize();
+    std::cout << "[phase] topk: synced" << std::endl;
 
     int failures = 0;
     failures += verify_exact(
@@ -302,9 +304,11 @@ int run_scores() {
     Tensor succ_tensor(device_succ.data(), DType::BF16, {kVocab, kRank});
     Tensor scores_tensor(device_scores.data(), DType::FP32,
                          {kScoresK, kTopK, kTopK, kScoresB});
+    std::cout << "[phase] scores: launching" << std::endl;
     ops::dflash_selector_scores(candidates_tensor, hidden_tensor, anchors_tensor, unary_tensor,
                                 pred_tensor, succ_tensor, scores_tensor, nullptr);
     cuda_synchronize();
+    std::cout << "[phase] scores: synced" << std::endl;
 
     int failures = 0;
     // FP32 accumulation of a 256-term contraction over |term| <= 0.125: the ulp-based
@@ -536,9 +540,11 @@ WalkRun run_walk(const std::vector<float>& scores, const std::vector<std::int32_
     Tensor scores_tensor(device_scores.data(), DType::FP32, {k, kTopK, kTopK, b_count});
     Tensor candidates_tensor(device_candidates.data(), DType::I32, {kTopK, k * b_count});
     Tensor drafts_tensor(device_drafts.data(), DType::I32, {k * b_count, 1});
+    std::cout << "[phase] walk(" << label << "): launching" << std::endl;
     ops::dflash_selector_walk(scores_tensor, candidates_tensor, configs.data(), drafts_tensor,
                               nullptr);
     cuda_synchronize();
+    std::cout << "[phase] walk(" << label << "): synced" << std::endl;
 
     WalkRun run;
     run.drafts   = from_device<std::int32_t>(device_drafts.data(), static_cast<std::size_t>(k) * b_count);

@@ -294,10 +294,36 @@ log "stage 3: GPU op unit tests (conv + selector)"
 CONV_TEST=$(ctest_name 'grouped_dynamic_conv_test')
 SEL_TEST=$(ctest_name 'dflash_selector_test')
 [ -n "$CONV_TEST" ] && [ -n "$SEL_TEST" ] || { bad "op tests not registered in ctest"; report "gpu op unit tests" "FAIL"; }
+# Auto-diagnosis: re-run a failed test under compute-sanitizer inside the GPU
+# container (mode A). Names the faulting kernel, address, PC and source line
+# (tests are compiled with -lineinfo). Report: /tmp/dflash2-sanitize-<name>.log
+sanitize_test() { # $1=binary name $2=timeout-seconds [$3...=extra docker run flags]
+  local name="$1" secs="$2"; shift 2
+  local out="/tmp/dflash2-sanitize-$name.log"
+  [ -x "$BUILD/tests/$name" ] || return 0
+  if [ "$GPU_MODE" != docker ]; then
+    info "sanitizer auto-run needs mode A (docker --gpus); native mode: run dflash2-sanitize.sh"
+    return 0
+  fi
+  warn "auto-diagnosing $name under compute-sanitizer (timeout ${secs}s) ..."
+  timeout "$secs" docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
+    "$@" \
+    "$(test_image)" \
+    bash -c "cd /build && /usr/local/cuda/bin/compute-sanitizer --tool memorycheck --show-backtrace 1 --print-limit 30 ./tests/$name" \
+    > "$out" 2>&1
+  echo "---- sanitizer report (tail) -> $out"
+  tail -25 "$out"
+}
 run_op_tests() {
+  FAILED_OPS=""
   if [ "$GPU_MODE" = docker ]; then
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
-      "$(test_image)" bash -c "cd /build && ctest -R '^(${CONV_TEST}|${SEL_TEST})\$' --output-on-failure"
+      "$(test_image)" bash -c "cd /build && ctest -R '^(${CONV_TEST}|${SEL_TEST})\$' --output-on-failure" \
+      > /tmp/dflash2-opdocker.log 2>&1
+    local rc=$?
+    cat /tmp/dflash2-opdocker.log
+    FAILED_OPS=$(sed -n 's/^ *[0-9][0-9]* - \([A-Za-z0-9_]*\) (.*/\1/p' /tmp/dflash2-opdocker.log | sort -u | tr '\n' ' ')
+    return $rc
   else
     extract_missing_libs "$BUILD/tests/$CONV_TEST" "$BUILD/tests/$SEL_TEST"
     info "running $CONV_TEST (native) ..."
@@ -307,6 +333,8 @@ run_op_tests() {
     ( cd "$BUILD/tests" && LD_LIBRARY_PATH="$CUDA13LIBS" ./"$SEL_TEST" ) \
       > /tmp/dflash2-opselector.log 2>&1; rc2=$?
     tail -3 /tmp/dflash2-opconv.log; tail -3 /tmp/dflash2-opselector.log
+    [ "$rc1" -ne 0 ] && FAILED_OPS="$FAILED_OPS $CONV_TEST"
+    [ "$rc2" -ne 0 ] && FAILED_OPS="$FAILED_OPS $SEL_TEST"
     [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]
   fi
 }
@@ -316,6 +344,10 @@ if run_op_tests; then
 else
   bad "op unit tests FAILED — logs: /tmp/dflash2-opconv.log /tmp/dflash2-opselector.log"
   report "gpu op unit tests" "FAIL"
+  [ -n "${FAILED_OPS:-}" ] || FAILED_OPS="$SEL_TEST"
+  for n in $FAILED_OPS; do
+    if [ "$n" = "$CONV_TEST" ]; then sanitize_test "$n" 600; else sanitize_test "$n" 900; fi
+  done
 fi
 
 # ---------- stage 4: artifact tests ----------
@@ -380,6 +412,8 @@ if [ "$VARIANT" = augmented ]; then
     report "engine dflash real" "PASS"
   else
     bad "engine dflash real FAILED — investigate"; report "engine dflash real" "FAIL"
+    sanitize_test "$REAL_TEST" 1800 -v "$(dirname "$ARTIFACT"):/artifacts" \
+      -e "NINFER_QWEN3_8_27B_WEIGHTS=/artifacts/$(basename "$ARTIFACT")"
   fi
 else
   skip "engine dflash real — needs the dflash-augmented artifact"
@@ -389,6 +423,10 @@ fi
 # ---------- summary ----------
 printf '\n================== SUMMARY ==================\n'
 printf '%s\n' "${RESULTS[@]}"
+if ls /tmp/dflash2-sanitize-*.log >/dev/null 2>&1; then
+  printf '\n== auto-diagnosis (compute-sanitizer reports) ==\n'
+  ls -1 /tmp/dflash2-sanitize-*.log
+fi
 printf '\n----------------------------------------------\n'
 if [ "$VARIANT" = fleet ]; then
 cat <<'NOTE'
