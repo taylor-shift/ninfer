@@ -41,6 +41,15 @@ inline constexpr int kSelectorTopkBlock        = 256;
 inline constexpr int kSelectorScoresBlock      = 256;
 inline constexpr int kSelectorWalkBlock        = 32;
 
+// The walk's per-row sampling configuration, passed BY VALUE as a kernel parameter (96-byte
+// POD, well inside the 4 KiB parameter limit). An array kernel parameter decays to a pointer:
+// launching with the launcher's stack arrays made the device dereference host stack addresses,
+// a deterministic illegal memory access on the walk's first temperature/seed read.
+struct DFlashWalkParams {
+    float temperature[kSelectorMaxB];
+    unsigned long long seed[kSelectorMaxB];
+};
+
 // Per-column top-16 with the sampling op's ordering (value descending, lower id on ties, the
 // smaller id occupying the higher-rank slot). 248320 = 256*970, so every thread owns a full
 // 970-row strided vocab slice; each thread keeps a register top-16, the slice tops are staged
@@ -170,15 +179,14 @@ __launch_bounds__(kSelectorScoresBlock) __global__
 // inverse-CDF convention.
 __launch_bounds__(kSelectorWalkBlock) __global__
     void dflash_selector_walk_kernel(const float* scores, const std::int32_t* candidates,
-                                     const float temperature[kSelectorMaxB],
-                                     const unsigned long long seed[kSelectorMaxB],
-                                     std::int32_t* drafts, std::int32_t k) {
+                                     const DFlashWalkParams params, std::int32_t* drafts,
+                                     std::int32_t k) {
     constexpr int kTopK = kSelectorTopK;
     const int b        = static_cast<int>(blockIdx.x);
     if (static_cast<int>(threadIdx.x) != 0) { return; }
 
-    const float temperature_b      = temperature[b];
-    const unsigned long long seed_b = seed[b];
+    const float temperature_b          = params.temperature[b];
+    const unsigned long long seed_b    = params.seed[b];
     const std::int64_t row_b_stride = static_cast<std::int64_t>(k) * kTopK * kTopK;
     int pred                       = 0; // the anchor slot
     for (int t = 0; t < k; ++t) {

@@ -72,22 +72,18 @@ void dflash_selector_scores_launch(const Tensor& candidates, const Tensor& hidde
 void dflash_selector_walk_launch(const Tensor& scores, const Tensor& candidates,
                                  const SamplingConfig* configs, Tensor& drafts, std::int32_t k,
                                  std::int32_t b_count, cudaStream_t stream) {
-    // Read the host rows once into kernel parameters (graph-capturable; the walk consumes only
-    // temperature and seed, spec doc 06 decision D8).
-    float temperature[kSelectorMaxB];
-    unsigned long long seed[kSelectorMaxB];
+    // The per-row sampling config is passed BY VALUE as a kernel parameter (DFlashWalkParams,
+    // 96-byte POD): array parameters decay to host pointers, which the device cannot
+    // dereference. Graph-capturable: no device-side allocation (spec doc 06 decision D8).
+    DFlashWalkParams params{};
     for (int b = 0; b < b_count; ++b) {
-        temperature[b] = configs[b].temperature;
-        seed[b]        = configs[b].seed;
-    }
-    for (int b = b_count; b < kSelectorMaxB; ++b) {
-        temperature[b] = 0.0f;
-        seed[b]        = 0ull;
+        params.temperature[b] = configs[b].temperature;
+        params.seed[b]        = configs[b].seed;
     }
     std::string cfg;
     for (int b = 0; b < b_count; ++b) {
-        cfg += " t" + std::to_string(b) + "=" + std::to_string(temperature[b]) +
-               " seed" + std::to_string(b) + "=" + std::to_string(seed[b]) + ";";
+        cfg += " t" + std::to_string(b) + "=" + std::to_string(params.temperature[b]) +
+               " seed" + std::to_string(b) + "=" + std::to_string(params.seed[b]) + ";";
     }
     launch_log("walk: launch grid=(" + std::to_string(b_count) + ",1,1) block=" +
                std::to_string(kSelectorWalkBlock) + " k=" + std::to_string(k) + " B=" +
@@ -97,7 +93,7 @@ void dflash_selector_walk_launch(const Tensor& scores, const Tensor& candidates,
     dflash_selector_walk_kernel<<<static_cast<unsigned int>(b_count), kSelectorWalkBlock, 0,
                                   stream>>>(
         static_cast<const float*>(scores.data), static_cast<const std::int32_t*>(candidates.data),
-        temperature, seed, static_cast<std::int32_t*>(drafts.data), k);
+        params, static_cast<std::int32_t*>(drafts.data), k);
     CUDA_CHECK(cudaGetLastError());
 }
 
