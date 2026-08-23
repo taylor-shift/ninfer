@@ -60,6 +60,11 @@ ARTIFACT=${ARTIFACT:-${NINFER_ARTIFACT:-/mnt/f/ninfer/models/qwen3_8_27b_nvfp4.n
 BUILD="$REPO/build-wsl"
 CONTAINER=ninfer-wsl
 IMAGE=nvidia/cuda:13.1.2-devel-ubuntu24.04
+# The build container is committed after stage 1 (apt toolchain + libav* etc.
+# installed): the GPU-mode docker runs use that image, because the base CUDA
+# image lacks the apt libraries the test binaries link against.
+FULL_IMAGE=ninfer-wsl-full
+test_image() { docker image inspect "$FULL_IMAGE" >/dev/null 2>&1 && printf '%s' "$FULL_IMAGE" || printf '%s' "$IMAGE"; }
 CUDA13LIBS="$REPO/.cuda13-libs"
 JOBS=${NINFER_JOBS:-$(nproc)}
 
@@ -104,17 +109,21 @@ missing_test_binaries() {
   cexec "cd /build && out=\$(ctest -N 2>/dev/null | sed -n 's/^ *Test *#[0-9]*: *//p') && m=0 && n=0 && for t in \$out; do n=\$((n+1)); if [ ! -f tests/\$t ] && [ ! -f \$t ]; then m=\$((m+1)); fi; done; echo \"\$m/\$n\""
 }
 
-# Extract only the shared libraries the WSL host is missing (per ldd),
-# one docker run per library, entrypoint-overridden (no image banner).
+# Extract only the shared libraries the WSL host is missing (per ldd).
+# Preferred source: the build container itself (its apt install provides libav*
+# & co.) — copied through the /src mount ($CUDA13LIBS = /src/.cuda13-libs inside
+# the container). Fallback: docker run against the base CUDA image (CUDART & co).
 extract_missing_libs() { # $@ = test binary paths (WSL-side)
   for bin in "$@"; do
     [ -x "$bin" ] || continue
     for lib in $(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}'); do
       [ -f "$CUDA13LIBS/$lib" ] && continue
-      info "extracting $lib from the image (one-time) ..."
-      docker run --rm --entrypoint bash -v "$CUDA13LIBS:/out" "$IMAGE" \
-        -c "f=\$(find /usr/local/cuda /usr/lib /lib /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu -name '$lib' -not -name '*stubs*' 2>/dev/null | head -1); [ -n \"\$f\" ] && cp -L \"\$f\" /out/ || exit 1" \
-        || warn "could not extract $lib — GPU tests may fail to load"
+      info "extracting $lib (one-time) ..."
+      if ! cexec "mkdir -p /src/.cuda13-libs && for p in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib /lib /usr/local/cuda; do [ -e \"\$p/$lib\" ] && cp -L \"\$p/$lib\" /src/.cuda13-libs/ && exit 0; done; exit 1" 2>/dev/null; then
+        docker run --rm --entrypoint bash -v "$CUDA13LIBS:/out" "$IMAGE" \
+          -c "f=\$(find /usr/local/cuda /usr/lib /lib /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu -name '$lib' -not -name '*stubs*' 2>/dev/null | head -1); [ -n \"\$f\" ] && cp -L \"\$f\" /out/ || exit 1"
+      fi
+      [ -f "$CUDA13LIBS/$lib" ] || warn "could not extract $lib — GPU tests may fail to load"
     done
   done
 }
@@ -257,6 +266,14 @@ else
   ok "build verified: all $missing_t test binaries present (ninja client rc=$build_rc, log: $BUILD/build.log)"
   cexec "tail -2 /build/build.log" || true
   report "build" "PASS"
+  # One-time image bake: the GPU-mode docker runs (stages 3/4) need the apt
+  # toolchain + libav* this container just installed; the base CUDA image lacks
+  # them. Committing is cheap and idempotent (fresh layer diff).
+  if docker commit -q "$CONTAINER" "$FULL_IMAGE" >/dev/null 2>&1; then
+    ok "committed $CONTAINER -> $FULL_IMAGE (test image for GPU-mode runs)"
+  else
+    warn "docker commit failed — GPU-mode runs will use the base image (apt libs missing)"
+  fi
 fi
 
 # ---------- stage 2: CPU tests (no GPU, no artifact) ----------
@@ -280,7 +297,7 @@ SEL_TEST=$(ctest_name 'dflash_selector_test')
 run_op_tests() {
   if [ "$GPU_MODE" = docker ]; then
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" \
-      "$IMAGE" bash -c "cd /build && ctest -R '^(${CONV_TEST}|${SEL_TEST})\$' --output-on-failure"
+      "$(test_image)" bash -c "cd /build && ctest -R '^(${CONV_TEST}|${SEL_TEST})\$' --output-on-failure"
   else
     extract_missing_libs "$BUILD/tests/$CONV_TEST" "$BUILD/tests/$SEL_TEST"
     info "running $CONV_TEST (native) ..."
@@ -310,7 +327,7 @@ run_artifact_test() { # $1=ctest regex $2=mode (docker|native)
   local pat="$1" mode="$2" bin
   if [ "$mode" = docker ]; then
     docker run --rm --gpus all --shm-size=8g -v "$BUILD:/build" -v "$REPO:/src" -e "$ART_ENV" \
-      "$IMAGE" bash -c "cd /build && ctest -R '$pat' --output-on-failure"
+      "$(test_image)" bash -c "cd /build && ctest -R '$pat' --output-on-failure"
     return $?
   fi
   # For these registrations the ctest test name is the binary name; strip the

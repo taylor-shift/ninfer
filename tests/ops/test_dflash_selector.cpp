@@ -160,9 +160,9 @@ int run_topk() {
         std::cerr << "selector topk fixture: col 1 tie resolution unexpected\n";
         return 1;
     }
-    if (expected.candidates[kTopkColumns * kTopK + 2 * kTopK + 0] != 124000 ||
-        expected.candidates[kTopkColumns * kTopK + 2 * kTopK + 1] != 124002 ||
-        expected.candidates[kTopkColumns * kTopK + 2 * kTopK + 15] != 124016) {
+    if (expected.candidates[2 * kTopK + 0] != 124000 ||
+        expected.candidates[2 * kTopK + 1] != 124002 ||
+        expected.candidates[2 * kTopK + 15] != 124016) {
         std::cerr << "selector topk fixture: col 2 boundary tie resolution unexpected\n";
         return 1;
     }
