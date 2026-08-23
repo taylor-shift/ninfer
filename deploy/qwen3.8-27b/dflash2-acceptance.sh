@@ -96,7 +96,9 @@ ctest_name() {
 # rejects that combination), and ctest -R exits 0 even when no test matches
 # — so ctest_count doubles as the no-match guard.
 ctest_count() { docker exec "$CONTAINER" bash -c "cd /build && ctest -N -R '$1' 2>/dev/null" | grep -c 'Test *#'; }
-ctest_run() { docker exec "$CONTAINER" bash -c "cd /build && ctest -R '$1' --output-on-failure"; }
+# The CPU dispatch test loads libcuda.so.1 at startup even though it never calls a driver
+# API; on the no-GPU build container the devel image's compat shim satisfies the loader.
+ctest_run() { docker exec "$CONTAINER" bash -c "cd /build && LD_LIBRARY_PATH=/usr/local/cuda-13.1/compat ctest -R '$1' --output-on-failure"; }
 
 missing_test_binaries() {
   cexec "cd /build && out=\$(ctest -N 2>/dev/null | sed -n 's/^ *Test *#[0-9]*: *//p') && m=0 && n=0 && for t in \$out; do n=\$((n+1)); if [ ! -f tests/\$t ] && [ ! -f \$t ]; then m=\$((m+1)); fi; done; echo \"\$m/\$n\""
@@ -111,7 +113,7 @@ extract_missing_libs() { # $@ = test binary paths (WSL-side)
       [ -f "$CUDA13LIBS/$lib" ] && continue
       info "extracting $lib from the image (one-time) ..."
       docker run --rm --entrypoint bash -v "$CUDA13LIBS:/out" "$IMAGE" \
-        -c "f=\$(find /usr/local/cuda /usr/lib /lib -name '$lib' -not -name '*stubs*' 2>/dev/null | head -1); [ -n \"\$f\" ] && cp -L \"\$f\" /out/ || exit 1" \
+        -c "f=\$(find /usr/local/cuda /usr/lib /lib /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu -name '$lib' -not -name '*stubs*' 2>/dev/null | head -1); [ -n \"\$f\" ] && cp -L \"\$f\" /out/ || exit 1" \
         || warn "could not extract $lib — GPU tests may fail to load"
     done
   done

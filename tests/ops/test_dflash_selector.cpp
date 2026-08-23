@@ -155,8 +155,8 @@ int run_topk() {
     const auto expected    = topk_oracle(logits_bits);
     // Fixture sanity: the tie columns resolve to the lowest ids, with the 17th col-2 token
     // excluded at the rank-15/16 boundary.
-    if (expected.candidates[kTopkColumns * kTopK + 0] != 100000 ||
-        expected.candidates[kTopkColumns * kTopK + 15] != 100015) {
+    if (expected.candidates[kTopK + 0] != 100000 ||
+        expected.candidates[kTopK + 15] != 100015) {
         std::cerr << "selector topk fixture: col 1 tie resolution unexpected\n";
         return 1;
     }
