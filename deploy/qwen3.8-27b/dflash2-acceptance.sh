@@ -318,7 +318,7 @@ sanitize_test() { # $1=binary name $2=timeout-seconds [$3...=extra docker run fl
     -e NINFER_LOG_OPS=1 \
     "$@" \
     "$(test_image)" \
-    bash -c "cd /build && /usr/local/cuda/bin/compute-sanitizer --tool memcheck --show-backtrace 1 --print-limit 30 ./tests/$name" \
+    bash -c "cd /build && /usr/local/cuda/bin/compute-sanitizer --tool memcheck --show-backtrace yes --print-limit 30 ./tests/$name" \
     > "$out" 2>&1
   echo "---- sanitizer report (tail) -> $out"
   tail -25 "$out"
