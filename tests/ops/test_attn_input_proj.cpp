@@ -521,9 +521,11 @@ int run_w8_dflash() {
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, 6144, 5120, 407U));
     int failures = 0;
-    // DFlash 2 (27B) propose runs T = 9*B (B = 1..8); T = 128 additionally
-    // exercises the full-tile (BN-aligned) launch path.
-    for (const std::int32_t tokens : {1, 9, 18, 72, 128}) {
+    // DFlash 2 (27B) propose runs T = (k+1)*B for k = 1..7, B = 1..8. The small-T SIMT
+    // routes split at T<=4 (c4) and T<=16 (c8), so cover both sides of that boundary and
+    // every production block width 2..8 individually; T = 128 exercises the full-tile
+    // (BN-aligned) MMA launch path.
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 18, 72, 128}) {
         failures += run_w8_dflash_case(parent, tokens);
     }
     return failures;
