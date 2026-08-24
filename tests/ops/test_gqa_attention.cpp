@@ -1207,13 +1207,13 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.width, batch});
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(maximum_visible),
                                              static_cast<std::uint32_t>(maximum_visible)};
+    const bool masked = std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
+                                    [&](std::int32_t valid) { return valid != test_case.width; });
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, batch, test_case.width, test_case.width);
+        geometry.q_heads, dtype, envelope, batch, test_case.width, test_case.width, masked);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
-    const bool masked = std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
-                                    [&](std::int32_t valid) { return valid != test_case.width; });
     ops::gqa_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows, kAttentionScale,
                        cache.view(), envelope, workspace, tout, nullptr);
     cuda_synchronize();
