@@ -414,6 +414,13 @@ int main() {
     failures += run_case(9, 3000, InputProfile::Random, 3000, 2048);
     failures += run_case(8, 96, InputProfile::Random, 2048, 2048);
     failures += run_case(2, 2048, InputProfile::WindowBoundary, 2048, 2048);
+    // DFlash 2 27B propose widths: the drafter runs T = (k+1) for k = 1..7, so every width
+    // 2..8 is a live production geometry. Widths 7 and 8 are the first to need two warps
+    // with a partially filled second warp (RowCount = 4T of Br = 32 rows).
+    for (const int tokens : {3, 4, 5, 6, 7}) {
+        failures += run_case(tokens, 2048, InputProfile::Random, 2048, 2048);
+        failures += run_case(tokens, 300, InputProfile::Random, 2048, 2048);
+    }
     failures += run_reject_unregistered_window();
     failures += run_batch_case();
 
