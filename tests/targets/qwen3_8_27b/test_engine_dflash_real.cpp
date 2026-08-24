@@ -315,6 +315,38 @@ int main() {
         }
     }
 
+    // Diagnostic matrix (env-gated): isolates which engine dimension breaks greedy
+    // route-invariance when the full fixture reports a licensed-output divergence.
+    if (std::getenv("NINFER_DFLASH_DIAG") != nullptr) {
+        const auto compare = [&](const char* label, ninfer::EngineOptions options) {
+            ninfer::Engine probe(std::move(options));
+            const ninfer::GenerationResult result =
+                probe.generate(probe.prepare_tokens(prompt), greedy_options(24, false));
+            const auto mismatch = std::mismatch(result.generated_token_ids.begin(),
+                                                result.generated_token_ids.end(),
+                                                target_output.begin(), target_output.end());
+            std::cerr << "[diag] " << label << ": tokens=" << result.generated_token_ids.size()
+                      << " first_mismatch="
+                      << (mismatch.first == result.generated_token_ids.end()
+                              ? -1
+                              : static_cast<long>(mismatch.first -
+                                                  result.generated_token_ids.begin()))
+                      << " rounds=" << result.speculative.rounds
+                      << " accepted=" << result.speculative.accepted_tokens
+                      << " fallback=" << result.speculative.fallback_steps << '\n';
+        };
+        {
+            auto options = dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352);
+            options.use_cuda_graph = false;
+            compare("dflash-4352-nograph", std::move(options));
+        }
+        compare("dflash-128-graph",
+                dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 128));
+        compare("dflash-4352-graph",
+                dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352));
+        return 0;
+    }
+
     {
         // Concurrent DFlash Graph route. The 27B target admits only the full output head
         // under dflash (D4), so the concurrent fixture exercises the full-head engine.
