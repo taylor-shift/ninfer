@@ -83,12 +83,16 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 
 /**
- * Qwen3.6 companion W8 specialization. The W8G32_F16S RowSplit parent has shape [6144,2048]
- * and stored row order [query 4096, key 1024, value 1024]. `x` is contiguous BF16 [2048,T],
- * q is contiguous BF16 [4096,T], and k/v are contiguous BF16 [1024,T]. Every route writes
- * the three independent final allocations directly; no parent output or transient workspace
- * is materialized. T may be any positive value. Q and K remain raw projection outputs: this
- * Op does not normalize or rotate either tensor.
+ * Qwen3.6/3.8 companion W8 specialization. The W8G32_F16S RowSplit parent has
+ * shape [6144,hidden] and stored row order [query 4096, key 1024, value 1024].
+ * Two hidden widths are registered: hidden 2048 (the Qwen3.6 35B companion)
+ * with `x` a contiguous BF16 [2048,T], and hidden 5120 (the Qwen3.8-27B
+ * DFlash 2 drafter) with `x` a contiguous BF16 [5120,T]. q is a contiguous
+ * BF16 [4096,T] and k/v are contiguous BF16 [1024,T] in both forms. Every
+ * route writes the three independent final allocations directly; no parent
+ * output or transient workspace is materialized. T may be any positive value.
+ * Q and K remain raw projection outputs: this Op does not normalize or rotate
+ * either tensor.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);

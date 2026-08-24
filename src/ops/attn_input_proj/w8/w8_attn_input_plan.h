@@ -48,4 +48,11 @@ void w8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Te
 void w8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                             cudaStream_t stream);
 
+// DFlash 2 (27B) QKV: W8G32_F16S RowSplit parent [6144, 5120], row order
+// [query 4096, key 1024, value 1024]; x [5120,T]; q [4096,T]; k/v [1024,T].
+void w8_dflash_qkv_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                              Tensor& v, cudaStream_t stream);
+void w8_dflash_qkv_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                            Tensor& v, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

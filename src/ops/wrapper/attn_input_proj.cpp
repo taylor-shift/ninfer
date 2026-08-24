@@ -46,13 +46,15 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
     }
 }
 
-void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
+void require_w8_rowsplit(const Weight& weight, std::int32_t rows, std::int32_t hidden,
+                         const char* label) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 2048 || weight.shape[0] != rows ||
-        weight.shape[1] != 2048 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 2048 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+        weight.ndim != 2 || weight.n != rows || weight.k != hidden || weight.shape[0] != rows ||
+        weight.shape[1] != hidden || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != hidden || weight.qhigh != nullptr ||
+        weight.high_plane_bytes != 0 || !aligned_to(weight.qdata, 16) ||
+        !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
     }
 }
@@ -165,7 +167,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(gate, kQRows, cols, "gate");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
-    require_w8_rowsplit(weight, kRows, "query/key/gate/value weight");
+    require_w8_rowsplit(weight, kRows, kHidden, "query/key/gate/value weight");
     detail::w8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
@@ -200,7 +202,14 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
-        if (parent_rows != 9216 || input_rows != 2048 || policy != LinearPolicy::A16Only) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
+        }
+        if (parent_rows == 6144 && input_rows == 5120) {
+            // DFlash 2 (27B) QKV: the split-output MMA route needs no transient storage.
+            return 0;
+        }
+        if (parent_rows != 9216 || input_rows != 2048) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }
         (void)detail::w8_attn_input_resolve_plan(
@@ -252,19 +261,28 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 1024;
     constexpr std::int32_t kRows   = 6144;
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-    require_matrix(x, kHidden, cols, "x");
+    // Two registered parent geometries share the row order [query 4096, key 1024,
+    // value 1024]: the 35B companion (hidden 2048) and the 27B DFlash 2 drafter
+    // (hidden 5120).
+    const std::int32_t hidden = query_key_value_weight.padded_shape[1];
+    if (hidden != 2048 && hidden != 5120) {
+        throw std::invalid_argument("attn_input_proj: invalid query/key/value weight");
+    }
+    require_matrix(x, hidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
-    require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight");
-
-    detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
+    require_w8_rowsplit(query_key_value_weight, kRows, hidden, "query/key/value weight");
+    if (hidden == 5120) {
+        detail::w8_dflash_qkv_dispatch(x, query_key_value_weight, q, k, v, stream);
+    } else {
+        detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
+    }
 }
 
 } // namespace ninfer::ops
