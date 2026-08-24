@@ -81,7 +81,7 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                     const double k_value =
                         key < context_keys
                             ? static_cast<double>(context_k[context_index(
-                                  d, kv_head, (context_begin + key) & (window - 1))])
+                                  d, kv_head, (context_begin + key) & (window - 1), window)])
                             : static_cast<double>(
                                   query_k[query_kv_index(d, kv_head, key - context_keys)]);
                     dot += static_cast<double>(q[q_index(d, q_head, token)]) * k_value;
@@ -103,7 +103,7 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
                     const double v_value =
                         key < context_keys
                             ? static_cast<double>(context_v[context_index(
-                                  d, kv_head, (context_begin + key) & (window - 1))])
+                                  d, kv_head, (context_begin + key) & (window - 1), window)])
                             : static_cast<double>(
                                   query_v[query_kv_index(d, kv_head, key - context_keys)]);
                     numerator += scores[static_cast<std::size_t>(key)] * v_value;
