@@ -634,6 +634,74 @@ std::vector<int> expected_walk_drafts(const std::vector<float>& scores,
     return expected;
 }
 
+// Production-width walk fixtures. The 27B DFlash 2 drafter runs k = draft_window = 7
+// (block width 8), but the shaped greedy/tie fixtures above are k=2 by construction, so
+// widths 3..7 were never exercised in this op. These builders reuse the same deterministic
+// background score field at an arbitrary k, over the same [16, k*B] candidate table.
+std::vector<std::int32_t> make_walk_candidates_k(std::int32_t k, std::int32_t b_count) {
+    const std::int32_t cols = k * b_count;
+    std::vector<std::int32_t> candidates(static_cast<std::size_t>(kTopK) * cols);
+    for (std::int32_t col = 0; col < cols; ++col) {
+        for (int rank = 0; rank < kTopK; ++rank) {
+            // Distinct ids within each column, distinct bases across columns.
+            candidates[static_cast<std::size_t>(col) * kTopK + rank] =
+                (1000 + col * 4099 + rank * 997) % kVocab;
+        }
+    }
+    return candidates;
+}
+
+std::vector<float> make_walk_scores_k(std::int32_t k, std::int32_t b_count) {
+    std::vector<float> scores(static_cast<std::size_t>(k) * kTopK * kTopK * b_count);
+    for (std::int32_t b = 0; b < b_count; ++b) {
+        for (std::int32_t p = 0; p < kTopK; ++p) {
+            for (std::int32_t c = 0; c < kTopK; ++c) {
+                for (std::int32_t t = 0; t < k; ++t) {
+                    scores[scores_offset(t, p, c, b, k)] = walk_background_score(t, p, c, b);
+                }
+            }
+        }
+    }
+    return scores;
+}
+
+int run_walk_widths() {
+    int failures = 0;
+    // Every production draft window for the 27B drafter, greedy and sampled, at B=1 and B=2.
+    for (const std::int32_t k : {3, 4, 5, 6, 7}) {
+        for (const std::int32_t b_count : {1, 2}) {
+            const auto candidates = make_walk_candidates_k(k, b_count);
+            const auto scores     = make_walk_scores_k(k, b_count);
+            const std::string tag =
+                "k=" + std::to_string(k) + " B=" + std::to_string(b_count);
+
+            std::vector<std::pair<float, std::uint64_t>> greedy_rows;
+            std::vector<std::pair<float, std::uint64_t>> sampled_rows;
+            for (std::int32_t b = 0; b < b_count; ++b) {
+                greedy_rows.emplace_back(0.0f, 1u + static_cast<std::uint64_t>(b));
+                sampled_rows.emplace_back(0.9f, 20260824u + static_cast<std::uint64_t>(b));
+            }
+
+            const std::string greedy_label = "selector walk width greedy " + tag;
+            const WalkRun greedy = run_walk(scores, candidates, k, greedy_rows, greedy_label);
+            failures += greedy.failures;
+            const auto greedy_expected =
+                expected_walk_drafts(scores, candidates, k, greedy_rows, greedy_label, failures);
+            failures += verify_exact((greedy_label + " drafts").c_str(), greedy.drafts,
+                                     greedy_expected);
+
+            const std::string sampled_label = "selector walk width sampled " + tag;
+            const WalkRun sampled = run_walk(scores, candidates, k, sampled_rows, sampled_label);
+            failures += sampled.failures;
+            const auto sampled_expected =
+                expected_walk_drafts(scores, candidates, k, sampled_rows, sampled_label, failures);
+            failures += verify_exact((sampled_label + " drafts").c_str(), sampled.drafts,
+                                     sampled_expected);
+        }
+    }
+    return failures;
+}
+
 int run_walks() {
     const auto candidates = make_walk_candidates();
     const auto greedy_scores   = make_walk_scores(true, true);
@@ -870,13 +938,15 @@ int main() {
     log_environment();
 
     int failures = 0;
-    logc("phase 1/4: topk");
+    logc("phase 1/5: topk");
     failures += run_topk();
-    logc("phase 2/4: scores");
+    logc("phase 2/5: scores");
     failures += run_scores();
-    logc("phase 3/4: walk");
+    logc("phase 3/5: walk");
     failures += run_walks();
-    logc("phase 4/4: rejection cases");
+    logc("phase 4/5: walk production widths k=3..7");
+    failures += run_walk_widths();
+    logc("phase 5/5: rejection cases");
     failures += rejection_cases();
 
     logc(failures == 0 ? "RESULT: OK — all checks passed"
