@@ -7,6 +7,7 @@
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
 #include "core/device.h"
+#include "core/tensor.h"
 #include "ops/common/math.h"
 
 #include <cuda_runtime.h>
