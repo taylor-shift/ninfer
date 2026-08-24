@@ -116,7 +116,16 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        // The DFlash backend entitlement reserves pages of the DRAFTER's full-attention
+        // paged pool (backend_kv_cache()), which is allocated exactly for hybrid drafters
+        // (local_layers < layers). A pure-SWA drafter (local_layers == layers) keeps its
+        // context in the per-lane local cyclic pool — lane-scoped, never counted against
+        // the shared KV — so its backend entitlement is zero. Reserving shared-KV pages
+        // against a pool that does not exist fails every request's admission fit check
+        // (admission capacity has zero backend pages).
+        if constexpr (DFlashConfig::local_layers < DFlashConfig::layers) {
+            base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        }
     }
     base->summary.admission = runtime::AdmissionResources{
         .active_lanes     = 1,
