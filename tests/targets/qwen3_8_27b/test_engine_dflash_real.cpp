@@ -352,6 +352,26 @@ int main() {
                 dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 128));
         compare("dflash-4352-graph",
                 dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352));
+        {
+            // Narrowest draft window: if k=1 also diverges, the fault is independent of the
+            // 8-column verify block width.
+            auto options = dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352);
+            options.speculative.draft_tokens = 1;
+            compare("dflash-k1", std::move(options));
+        }
+        {
+            // MTP on the same target and artifact: shares target_verify_accept and
+            // gdn_replay_fold with DFlash but uses a different drafter. Divergence here too
+            // implicates the shared speculative machinery rather than the DFlash 2 path.
+            auto options = ordinary_engine_options(artifact.c_str());
+            options.max_context               = 4352;
+            options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4352);
+            options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens  = 3;
+            options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+            options.use_cuda_graph            = true;
+            compare("mtp-3", std::move(options));
+        }
         return 0;
     }
 
