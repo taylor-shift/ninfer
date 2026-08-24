@@ -2128,7 +2128,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const char* value = std::getenv("NINFER_DFLASH_TRACE");
             return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
         }();
-        if (dflash_trace && io.dflash_decode != nullptr) {
+        if (dflash_trace && io.dflash_decode.has_value()) {
             const qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
             const std::size_t rows                  = lanes.size();
             std::vector<TokenId> host_drafts(rows * draft_window, 0);
