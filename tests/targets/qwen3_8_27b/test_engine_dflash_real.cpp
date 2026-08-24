@@ -113,7 +113,9 @@ int verify_dflash_load(const ninfer::Engine& engine, std::uint32_t max_context) 
     // a fleet (1124-object) artifact fails the dflash bind before load
     // summary exists.
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" || load.weights_id != "nvfp4-dflash2" ||
+    // The registry publishes the qwen3.8 artifact under the dedicated qwen3_8 target key
+    // (Qwen3_6_27B::qwen3_8_target_key), not the qwen3_6 package key.
+    if (load.target != "qwen3_8_27b" || load.weights_id != "nvfp4-dflash2" ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "DFlash Engine materialized an invalid artifact payload: target="
                   << load.target << " weights=" << load.weights_id << " (expected nvfp4-dflash2)\n";
