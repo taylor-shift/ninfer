@@ -334,7 +334,15 @@ int main() {
                       << " rounds=" << result.speculative.rounds
                       << " accepted=" << result.speculative.accepted_tokens
                       << " fallback=" << result.speculative.fallback_steps << '\n';
+            std::cerr << "[diag] " << label << " stream:";
+            for (const ninfer::TokenId token : result.generated_token_ids) {
+                std::cerr << ' ' << token;
+            }
+            std::cerr << '\n';
         };
+        std::cerr << "[diag] target stream:";
+        for (const ninfer::TokenId token : target_output) { std::cerr << ' ' << token; }
+        std::cerr << '\n';
         {
             auto options = dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352);
             options.use_cuda_graph = false;
