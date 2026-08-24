@@ -5,6 +5,7 @@
 // only the split-output epilogue and the runtime m/k differ. CTA row tiles (BM)
 // must not straddle a segment boundary, so both boundaries are asserted below.
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
+#include "ops/linear/w8/w8_rowsplit_gemm_simt.cuh"
 
 #include "core/device.h"
 #include "core/tensor.h"
@@ -44,6 +45,39 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                                  output, kParentRows, kHidden, x.ne[1], kHidden);
 }
 
+// SIMT variant for small T: fp32 dequant + fp32 FMA accumulation (no bf16 weight
+// rounding), matching the accuracy profile the generic W8 linear dispatch uses for
+// this [6144, 5120] shape at T <= 16. k = 5120 is 5 whole 1024-K slabs, no tail.
+template <int ColsPerTile, bool Full>
+void launch_simt_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                         cudaStream_t stream) {
+    constexpr int kRowsPerCta = 8;
+    constexpr int kStages     = 2;
+    static_assert((kQueryRows % kRowsPerCta) == 0 && (kKeyRows % kRowsPerCta) == 0);
+    const Output output{static_cast<__nv_bfloat16*>(q.data),
+                        static_cast<__nv_bfloat16*>(k.data),
+                        static_cast<__nv_bfloat16*>(v.data)};
+    const dim3 grid(kParentRows / kRowsPerCta,
+                    static_cast<unsigned>(div_up(x.ne[1], ColsPerTile)), 1u);
+    w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, ColsPerTile, kRowsPerCta, kStages, Full,
+                                 W8Epilogue::Store, Output>
+        <<<grid, kRowsPerCta * 32, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                                static_cast<const std::uint8_t*>(weight.qdata),
+                                                static_cast<const std::uint8_t*>(weight.scales),
+                                                output, kParentRows, kHidden, x.ne[1], kHidden,
+                                                kHidden / 1024);
+}
+
+template <int ColsPerTile>
+void launch_simt_route(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                       cudaStream_t stream) {
+    if ((x.ne[1] % ColsPerTile) == 0) {
+        launch_simt_variant<ColsPerTile, true>(x, weight, q, k, v, stream);
+    } else {
+        launch_simt_variant<ColsPerTile, false>(x, weight, q, k, v, stream);
+    }
+}
+
 } // namespace
 
 void w8_dflash_qkv_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
@@ -61,6 +95,19 @@ void w8_dflash_qkv_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, 
 
 void w8_dflash_qkv_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                             Tensor& v, cudaStream_t stream) {
+    // Mirror the generic W8 linear route boundaries for k=5120: SIMT (fp32-accurate)
+    // for decode-scale T, MMA for throughput T.
+    const std::int32_t tokens = x.ne[1];
+    if (tokens >= 1 && tokens <= 4) {
+        launch_simt_route<4>(x, weight, q, k, v, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (tokens <= 16) {
+        launch_simt_route<8>(x, weight, q, k, v, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     w8_dflash_qkv_mma_launch(x, weight, q, k, v, stream);
 }
 
