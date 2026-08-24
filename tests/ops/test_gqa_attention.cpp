@@ -1268,6 +1268,21 @@ int run_batch_cases() {
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
+    // DFlash 2 target verification runs block width k+1 for k=1..7, i.e. widths 2..8. The
+    // decode route splits at width 6 (gqa_attention_uses_small_t covers 1..6 only), and the
+    // batch cases above jump 6 -> 16, leaving widths 7 and 8 — both live 27B geometries — on
+    // the far side of that boundary untested. Cover 5..8 at B=1 and B=2, the second row with
+    // a short valid column so the masked path is exercised as well.
+    for (const std::int32_t width : {5, 6, 7, 8}) {
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {127}, {width}, {0}, MappingPattern::Identity,
+             static_cast<std::uint32_t>(600 + width)});
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {61, 511}, {width, width - 1}, {1, 0}, MappingPattern::Fragmented,
+             static_cast<std::uint32_t>(620 + width)});
+    }
     return failures;
 }
 
