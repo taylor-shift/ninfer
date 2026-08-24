@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -2118,6 +2121,53 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        // Round-level trace (NINFER_DFLASH_TRACE=1): copies the proposal and verification
+        // buffers back to the host so a divergence can be attributed to the drafts, the
+        // target's own argmax, or the acceptance step directly from one round's data.
+        static const bool dflash_trace = [] {
+            const char* value = std::getenv("NINFER_DFLASH_TRACE");
+            return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+        }();
+        if (dflash_trace && io.dflash_decode != nullptr) {
+            const qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
+            const std::size_t rows                  = lanes.size();
+            std::vector<TokenId> host_drafts(rows * draft_window, 0);
+            std::vector<TokenId> host_verify(rows * width, 0);
+            std::vector<TokenId> host_target(rows * width, 0);
+            CUDA_CHECK(cudaMemcpy(host_drafts.data(), frame.draft_tokens.data,
+                                  host_drafts.size() * sizeof(TokenId), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_verify.data(), frame.verify_ids.data,
+                                  host_verify.size() * sizeof(TokenId), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_target.data(), frame.target_argmax.data,
+                                  host_target.size() * sizeof(TokenId), cudaMemcpyDeviceToHost));
+            for (std::size_t row = 0; row < rows; ++row) {
+                std::fprintf(stderr,
+                             "[dflash.trace] lane=%u k=%u width=%u extent=%d accepted=%d "
+                             "licensed=%d anchor=%d frontier=%d\n",
+                             lanes[row], draft_window, width,
+                             dflash_host_ingress->proposal_extents[row],
+                             dflash_host_egress->accepted_drafts[row],
+                             dflash_host_egress->licensed_counts[row],
+                             dflash_host_ingress->anchors[row],
+                             dflash_host_ingress->execution_frontiers[row]);
+                const auto dump = [&](const char* label, const std::vector<TokenId>& data,
+                                      std::uint32_t stride, std::int32_t count) {
+                    std::fprintf(stderr, "[dflash.trace]   %-10s:", label);
+                    for (std::int32_t i = 0; i < count; ++i) {
+                        std::fprintf(stderr, " %d", data[row * stride + static_cast<std::size_t>(i)]);
+                    }
+                    std::fprintf(stderr, "\n");
+                };
+                dump("drafts", host_drafts, draft_window,
+                     static_cast<std::int32_t>(draft_window));
+                dump("verify_ids", host_verify, width, static_cast<std::int32_t>(width));
+                dump("target_arg", host_target, width, static_cast<std::int32_t>(width));
+                dump("licensed", std::vector<TokenId>(dflash_host_egress->licensed_tokens.begin(),
+                                                      dflash_host_egress->licensed_tokens.end()),
+                     width, dflash_host_egress->licensed_counts[row]);
+            }
+            std::fflush(stderr);
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];
