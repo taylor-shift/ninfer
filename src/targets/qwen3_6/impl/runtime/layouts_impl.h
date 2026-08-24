@@ -264,9 +264,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
+        // Speculative verification (TextPhase::Verify) supplies valid_columns, so its blocks
+        // take the masked reroute off the prompt route and need the chunked reservation.
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
-                            max_width));
+                            max_width, phase == qwen3_6::TextPhase::Verify));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };

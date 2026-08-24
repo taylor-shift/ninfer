@@ -353,7 +353,7 @@ const char* gqa_attention_route_name(GqaAttentionRoute route) {
 std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
-                                                   std::int32_t max_width) {
+                                                   std::int32_t max_width, bool masked) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
@@ -377,7 +377,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         // Mirrors the masked-verify reroute in gqa_attention: a Prompt-route width that
         // verification can reach must still be sized for the chunked path, because the
         // executing call reroutes it. Sizing it 0 here would hand the op an empty arena.
-        if (route == detail::GqaAttentionRoute::Prompt && width > kSmallTChunkTokens &&
+        // Unmasked callers keep the prompt route and its zero reservation.
+        if (masked && route == detail::GqaAttentionRoute::Prompt && width > kSmallTChunkTokens &&
             width <= kMaximumVerifyTokens) {
             std::size_t rerouted = 0;
             for (std::int32_t begin = 0; begin < width; begin += kSmallTChunkTokens) {

@@ -51,11 +51,17 @@ struct GqaExecutionEnvelope {
  * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
  * return zero.
+ *
+ * masked declares whether the caller supplies valid_columns. Masked blocks of verification
+ * width never run the prompt route (see gqa_attention), so they reserve the chunked decode
+ * capacity instead of zero. Unmasked callers (prefill, gqa_attention_cached) keep the prompt
+ * route and its zero reservation.
  */
 [[nodiscard]] std::size_t
 gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
                                        GqaExecutionEnvelope envelope, std::int32_t batch_size,
-                                       std::int32_t min_width, std::int32_t max_width);
+                                       std::int32_t min_width, std::int32_t max_width,
+                                       bool masked = false);
 
 /**
  * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let
