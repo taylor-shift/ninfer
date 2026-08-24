@@ -327,12 +327,6 @@ GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t
                                               GqaExecutionEnvelope envelope) {
     if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
-    // EXPERIMENT (revert if it does not change the k>=6 engine divergence): route every
-    // verify-width single-row call through ChunkedSmallT regardless of head count. The
-    // 27B target has 24 q_heads, so the q_heads==16 escape below never fires and its
-    // speculative verification falls to the Prompt prefill route at width>=7 — exactly
-    // where the engine starts diverging.
-    if (width <= kMaximumVerifyTokens) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
         width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
     if (q_heads == 16 && width <= kMaximumVerifyTokens &&
