@@ -434,10 +434,19 @@ int main() {
         std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
-    for (const int k : {1, 5, 15}) failures += prepare_verify_case(k);
+    for (const int k : {1, 5, 6, 7, 15}) failures += prepare_verify_case(k);
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
+    // The 27B DFlash 2 drafter runs k=7 (block width 8), and the engine k-sweep puts the
+    // divergence threshold between k=5 and k=6 — widths this suite skipped entirely. Cover
+    // every acceptance count at both: full rejection, interior mismatch, full acceptance
+    // (which commits the bonus column).
+    for (const int k : {6, 7}) {
+        for (int accepted = 0; accepted <= k; ++accepted) {
+            failures += greedy_accept_case(k, accepted);
+        }
+    }
     failures += greedy_accept_case(15, 7, 257);
     failures += deterministic_sampling_case();
     failures += batched_sampling_workspace_stride_case();
