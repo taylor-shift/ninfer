@@ -63,9 +63,14 @@ bool dflash_target_uses_chunked_small_t(std::uint32_t draft_window, std::uint32_
                                         std::uint32_t max_visible_keys) {
     const std::uint32_t tokens = draft_window + 1;
     if (tokens <= 6) { return false; }
-    if (batch_size > 1) { return true; }
-    const std::uint32_t prompt_visible_limit = tokens <= 12 ? 512U : 1024U;
-    return max_visible_keys > prompt_visible_limit;
+    (void)batch_size;
+    (void)max_visible_keys;
+    // Speculative verification always supplies valid_columns, and gqa_attention routes every
+    // such masked block of verify width off the Prompt prefill path onto ChunkedSmallT. The
+    // graph topology class must predict the route the round actually executes; the previous
+    // form mirrored resolve_route's batch/visible-key thresholds, which never matched this
+    // target anyway because those escapes require q_heads == 16 and the 27B text stack has 24.
+    return true;
 }
 
 void validate_token_interval(std::int32_t first, std::int32_t last) {
