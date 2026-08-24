@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -353,11 +354,14 @@ int main() {
         compare("dflash-4352-graph",
                 dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352));
         {
-            // Narrowest draft window: if k=1 also diverges, the fault is independent of the
-            // 8-column verify block width.
-            auto options = dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352);
-            options.speculative.draft_tokens = 1;
-            compare("dflash-k1", std::move(options));
+            // Draft-window sweep: k=1 and MTP width 4 are known-good, k=7 diverges. Locate the
+            // exact width at which the block breaks.
+            for (const std::uint32_t probe_k : {1U, 2U, 3U, 4U, 5U, 6U, 7U}) {
+                auto options =
+                    dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352);
+                options.speculative.draft_tokens = probe_k;
+                compare(("dflash-k" + std::to_string(probe_k)).c_str(), std::move(options));
+            }
         }
         {
             // MTP on the same target and artifact: shares target_verify_accept and
