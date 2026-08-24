@@ -1282,6 +1282,19 @@ int run_batch_cases() {
             kGeometries[0], DType::BF16,
             {width, {61, 511}, {width, width - 1}, {1, 0}, MappingPattern::Fragmented,
              static_cast<std::uint32_t>(620 + width)});
+        // B=1 WITH a short valid column. This is the engine's actual verify shape: the
+        // speculative block always passes valid_columns, so at width >= 7 the 27B target
+        // (24 q_heads, so the q_heads==16 escape never fires) resolves to the MASKED
+        // Prompt route. The B=1 cases above use valid == width, which makes the harness
+        // pass a null valid_columns and take the unmasked path instead.
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {127}, {width - 1}, {0}, MappingPattern::Identity,
+             static_cast<std::uint32_t>(640 + width)});
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {2048}, {1}, {0}, MappingPattern::Fragmented,
+             static_cast<std::uint32_t>(660 + width)});
     }
     return failures;
 }
