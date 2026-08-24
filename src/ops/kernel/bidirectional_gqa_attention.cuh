@@ -373,16 +373,20 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
             const bool row1_live = row1 < RowCount && row1 / kBidirectionalGqaGroup < valid;
             const bool allow00 =
                 row0_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position0 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col0 >= q_position0 - (SwaWindow - 1));
             const bool allow01 =
                 row0_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position0 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col1 >= q_position0 - (SwaWindow - 1));
             const bool allow10 =
                 row1_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position1 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col0 >= q_position1 - (SwaWindow - 1));
             const bool allow11 =
                 row1_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position1 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col1 >= q_position1 - (SwaWindow - 1));
             score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
             score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
             score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;
