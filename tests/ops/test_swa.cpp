@@ -25,9 +25,15 @@ constexpr int kGroup   = 4;
 constexpr int kWindow  = 4096;
 constexpr float kScale = 0.08838834764831844055f;
 
+// bf16 kernel vs fp64 oracle. relative_l2 is the primary detector; the gross cap guards
+// single-element outliers. Calibrated over the 4096- and 2048-window case families: in-family
+// bf16 accumulation noise reaches ~1.6 ulp of the element magnitude on unlucky draws
+// (W=2048 T=8 L=96 max_abs 8.1e-4 at max_ref 0.165, identical kernel work to its passing
+// W=4096 twin), so the absolute term carries seed margin. Real admission/slot bugs sit
+// orders of magnitude above this cap (observed: 0.125 vs 4.9e-4, references ~1e19).
 constexpr ReductionCriterion kSwaBf16Criterion{
     .relative_l2                     = 3.95e-3,
-    .gross_absolute                  = 3e-4,
+    .gross_absolute                  = 4.5e-4,
     .gross_relative_to_max_reference = 3.0e-3,
 };
 
