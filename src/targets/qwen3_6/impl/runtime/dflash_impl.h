@@ -500,6 +500,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             }();
             static int seen = 0;
             static bool written = false;
+            if (dump) {
+                // Always report the per-round append count: if this is 0 on rounds after
+                // the first, the drafter is attending to a context that never advances.
+                std::vector<std::int32_t> probe(static_cast<std::size_t>(batch_size));
+                CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
+                CUDA_CHECK(cudaMemcpy(probe.data(), append_counts.data,
+                                      probe.size() * sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost));
+                std::fprintf(stderr, "[dflash.count] round=%d append_count=%d\n", seen + 1,
+                             probe[0]);
+            }
             if (dump && !written && batch_size == 1 && ++seen >= target_round) {
                 written = true;
                 const std::int32_t rows = Variant::DFlashConfig::feature_rows;
