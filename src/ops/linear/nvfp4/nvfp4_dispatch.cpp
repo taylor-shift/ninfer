@@ -36,7 +36,10 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
         return tokens >= 5 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
-        return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+        // EXPERIMENT (revert after measuring): force the residual GEMMs to bf16 activations
+        // to confirm that the tokens>=8 W4A4 switch is what makes a k=7 speculative round
+        // (block width 8) disagree with an ordinary bf16 decode.
+        return Nvfp4LinearRoute::A16;
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }
