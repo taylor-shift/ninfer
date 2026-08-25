@@ -2160,6 +2160,32 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 };
                 dump("drafts", host_drafts, draft_window,
                      static_cast<std::int32_t>(draft_window));
+                // Per-column checksum of the target's post-stem hidden state. If a column's
+                // argmax differs between draft windows while its checksum matches, the fault
+                // is in the head/argmax; if the checksum already differs, the fault is
+                // upstream in the target stem for that column.
+                {
+                    const qwen3_6::DFlashDecodeState& f = *io.dflash_decode;
+                    const std::size_t hidden_cols =
+                        static_cast<std::size_t>(TextConfig::hidden) * width;
+                    std::vector<std::uint16_t> host_hidden(hidden_cols, 0);
+                    CUDA_CHECK(cudaMemcpy(host_hidden.data(),
+                                          static_cast<const std::uint8_t*>(f.target_hidden.data) +
+                                              row * hidden_cols * sizeof(std::uint16_t),
+                                          hidden_cols * sizeof(std::uint16_t),
+                                          cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr, "[dflash.trace]   hidden_sum:");
+                    for (std::uint32_t col = 0; col < width; ++col) {
+                        std::uint64_t acc = 0;
+                        for (std::int32_t i = 0; i < TextConfig::hidden; ++i) {
+                            acc += host_hidden[static_cast<std::size_t>(col) * TextConfig::hidden +
+                                               static_cast<std::size_t>(i)];
+                        }
+                        std::fprintf(stderr, " %llu",
+                                     static_cast<unsigned long long>(acc));
+                    }
+                    std::fprintf(stderr, "\n");
+                }
                 dump("verify_ids", host_verify, width, static_cast<std::int32_t>(width));
                 dump("target_arg", host_target, width, static_cast<std::int32_t>(width));
                 dump("licensed", std::vector<TokenId>(dflash_host_egress->licensed_tokens.begin(),
