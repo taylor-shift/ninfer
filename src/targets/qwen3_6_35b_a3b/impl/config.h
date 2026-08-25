@@ -88,6 +88,12 @@ struct DFlashConfig {
     static constexpr float attention_scale = 0.08838834764831845F;
     static constexpr std::array<int, feature_layers> target_feature_layers{1,  6,  11, 16,
                                                                            22, 27, 32, 37};
+    // DFlash 2 fields (spec doc 06 section 3): the 35B v1 drafter leaves both groups at zero,
+    // which compiles every shared DFlash 2 code path out of the v1 schedule.
+    static constexpr int conv_kernel_size = 0;
+    static constexpr int conv_group_size  = 0;
+    static constexpr int selector_rank    = 0;
+    static constexpr int selector_top_k   = 0;
 };
 
 inline constexpr float kAttentionScale                   = 0.0625F;

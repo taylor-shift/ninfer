@@ -1110,6 +1110,104 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
     return failures;
 }
 
+// Chunk-boundary invariance: the chunked decode route splits a block wider than six into
+// [0,6) plus a remainder. Columns inside the FIRST chunk must not depend on whether a second
+// chunk follows — chunk 1's attention window and key set are identical either way. This runs
+// the same prefix twice against identical caches (width 6, single chunk; width 8, two chunks)
+// and compares the shared six columns. The 27B DFlash 2 engine diverges exactly here: at
+// draft window k=7 (width 8) the target's argmax changes for a first-chunk column that has
+// identical inputs at k=5 (width 6).
+// valid_override < 0 means "every column live" (valid == width). A positive value pins the
+// SAME live column count into both runs, so the only difference is the physical block width:
+// that separates a content effect (extra live columns changing the result) from a pure
+// tiling/reduction-order effect (identical live content, different physical T).
+int run_chunk_invariance_case(const Geometry& geometry, DType dtype, std::int32_t context,
+                              std::uint32_t seed, std::int32_t valid_override = -1) {
+    constexpr std::int32_t kNarrow = 6;
+    constexpr std::int32_t kWide   = 8;
+    const std::size_t q_column_elements  = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
+    const std::size_t kv_column_elements = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads;
+    const std::int32_t max_context       = context + kWide + 3;
+
+    // One shared column pool; the narrow run uses its first six columns.
+    std::vector<float> q = make_bf16_values(q_column_elements * kWide, seed, -0.25f, 0.25f);
+    std::vector<float> k = make_bf16_values(kv_column_elements * kWide, seed + 1u, -0.25f, 0.25f);
+    std::vector<float> v = make_bf16_values(kv_column_elements * kWide, seed + 2u, -1.0f, 1.0f);
+    inject_codec_edges(geometry, kWide, k, v);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(kWide));
+    for (std::int32_t token = 0; token < kWide; ++token) {
+        positions[static_cast<std::size_t>(token)] = context + token;
+    }
+
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+
+    const auto run_width = [&](std::int32_t width) {
+        const HostCache initial = make_cache(geometry, dtype, max_context, seed + 20u);
+        BatchDeviceCache cache(std::span<const HostCache>(&initial, 1), MappingPattern::Identity);
+        const std::size_t columns = static_cast<std::size_t>(width);
+        DeviceBuffer dq  = to_device(std::vector<std::uint16_t>(
+            q_bits.begin(), q_bits.begin() + static_cast<std::ptrdiff_t>(q_column_elements * columns)));
+        DeviceBuffer dk  = to_device(std::vector<std::uint16_t>(
+            k_bits.begin(), k_bits.begin() + static_cast<std::ptrdiff_t>(kv_column_elements * columns)));
+        DeviceBuffer dv  = to_device(std::vector<std::uint16_t>(
+            v_bits.begin(), v_bits.begin() + static_cast<std::ptrdiff_t>(kv_column_elements * columns)));
+        DeviceBuffer dp  = to_device(std::vector<std::int32_t>(
+            positions.begin(), positions.begin() + width));
+        const std::int32_t live =
+            valid_override < 0 ? width : std::min(valid_override, width);
+        DeviceBuffer dvalid = to_device(std::vector<std::int32_t>{live});
+        DeviceBuffer drows  = to_device(std::vector<std::int32_t>{0});
+        GuardedDeviceBuffer dout(q_column_elements * columns * sizeof(std::uint16_t));
+        dout.fill(0xcd);
+
+        Tensor tq(dq.p, DType::BF16, {kHeadDim, geometry.q_heads, width, 1});
+        Tensor tk(dk.p, DType::BF16, {kHeadDim, geometry.kv_heads, width, 1});
+        Tensor tv(dv.p, DType::BF16, {kHeadDim, geometry.kv_heads, width, 1});
+        Tensor tp(dp.p, DType::I32, {width, 1});
+        Tensor tvalid(dvalid.p, DType::I32, {1});
+        Tensor trows(drows.p, DType::I32, {1});
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, 1});
+
+        const auto visible = static_cast<std::uint32_t>(context + width);
+        const ops::GqaExecutionEnvelope envelope{visible, visible};
+        const std::size_t bytes = ops::gqa_attention_workspace_capacity_bytes(
+            geometry.q_heads, dtype, envelope, 1, width, width, true);
+        GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(bytes, 256));
+        WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+        ops::gqa_attention(tq, tk, tv, tp, tvalid, trows, kAttentionScale, cache.view(), envelope,
+                           workspace, tout, nullptr);
+        cuda_synchronize();
+        return from_device_bf16(dout.data(), q_column_elements * columns);
+    };
+
+    const std::vector<double> narrow = run_width(kNarrow);
+    const std::vector<double> wide   = run_width(kWide);
+
+    const std::string label = std::string("gqa_attention chunk invariance ") + geometry.name + " " +
+                              cache_name(dtype) + " context=" + std::to_string(context) +
+                              (valid_override < 0 ? " valid=full"
+                                                  : " valid=" + std::to_string(valid_override));
+    int failures = 0;
+    const std::int32_t compare_columns =
+        valid_override < 0 ? kNarrow : std::min(valid_override, kNarrow);
+    for (std::int32_t token = 0; token < compare_columns; ++token) {
+        for (std::size_t element = 0; element < q_column_elements; ++element) {
+            const std::size_t index = static_cast<std::size_t>(token) * q_column_elements + element;
+            if (narrow[index] != wide[index]) {
+                std::cerr << label << ": first-chunk column " << token
+                          << " changed when a second chunk was added (element " << element
+                          << ": width6=" << narrow[index] << " width8=" << wide[index] << ")\n";
+                ++failures;
+                break;
+            }
+        }
+        if (failures != 0) { break; }
+    }
+    return failures;
+}
+
 int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCase& test_case) {
     const std::int32_t batch = static_cast<std::int32_t>(test_case.contexts.size());
     if (batch <= 0 || test_case.valid_columns.size() != static_cast<std::size_t>(batch) ||
@@ -1207,13 +1305,13 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.width, batch});
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(maximum_visible),
                                              static_cast<std::uint32_t>(maximum_visible)};
+    const bool masked = std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
+                                    [&](std::int32_t valid) { return valid != test_case.width; });
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, dtype, envelope, batch, test_case.width, test_case.width);
+        geometry.q_heads, dtype, envelope, batch, test_case.width, test_case.width, masked);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
-    const bool masked = std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
-                                    [&](std::int32_t valid) { return valid != test_case.width; });
     ops::gqa_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows, kAttentionScale,
                        cache.view(), envelope, workspace, tout, nullptr);
     cuda_synchronize();
@@ -1268,6 +1366,42 @@ int run_batch_cases() {
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
+    // DFlash 2 target verification runs block width k+1 for k=1..7, i.e. widths 2..8. The
+    // decode route splits at width 6 (gqa_attention_uses_small_t covers 1..6 only), and the
+    // batch cases above jump 6 -> 16, leaving widths 7 and 8 — both live 27B geometries — on
+    // the far side of that boundary untested. Cover 5..8 at B=1 and B=2, the second row with
+    // a short valid column so the masked path is exercised as well.
+    for (const std::int32_t width : {5, 6, 7, 8}) {
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {127}, {width}, {0}, MappingPattern::Identity,
+             static_cast<std::uint32_t>(600 + width)});
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {61, 511}, {width, width - 1}, {1, 0}, MappingPattern::Fragmented,
+             static_cast<std::uint32_t>(620 + width)});
+        // B=1 WITH a short valid column. This is the engine's actual verify shape: the
+        // speculative block always passes valid_columns, so at width >= 7 the 27B target
+        // (24 q_heads, so the q_heads==16 escape never fires) resolves to the MASKED
+        // Prompt route. The B=1 cases above use valid == width, which makes the harness
+        // pass a null valid_columns and take the unmasked path instead.
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {127}, {width - 1}, {0}, MappingPattern::Identity,
+             static_cast<std::uint32_t>(640 + width)});
+        failures += run_batch_case(
+            kGeometries[0], DType::BF16,
+            {width, {2048}, {1}, {0}, MappingPattern::Fragmented,
+             static_cast<std::uint32_t>(660 + width)});
+    }
+    // Chunk-boundary invariance for the 27B verify geometry (the k=7 engine signature).
+    for (const std::int32_t context : {16, 61, 127}) {
+        failures += run_chunk_invariance_case(kGeometries[0], DType::BF16, context,
+                                              static_cast<std::uint32_t>(700 + context));
+        // Same live column count in both runs: isolates physical width from content.
+        failures += run_chunk_invariance_case(kGeometries[0], DType::BF16, context,
+                                              static_cast<std::uint32_t>(700 + context), 6);
+    }
     return failures;
 }
 

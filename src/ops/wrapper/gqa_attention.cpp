@@ -353,7 +353,7 @@ const char* gqa_attention_route_name(GqaAttentionRoute route) {
 std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
-                                                   std::int32_t max_width) {
+                                                   std::int32_t max_width, bool masked) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
@@ -374,6 +374,19 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
             detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
+        // Mirrors the masked-verify reroute in gqa_attention: a Prompt-route width that
+        // verification can reach must still be sized for the chunked path, because the
+        // executing call reroutes it. Sizing it 0 here would hand the op an empty arena.
+        // Unmasked callers keep the prompt route and its zero reservation.
+        if (masked && route == detail::GqaAttentionRoute::Prompt && width > kSmallTChunkTokens &&
+            width <= kMaximumVerifyTokens) {
+            std::size_t rerouted = 0;
+            for (std::int32_t begin = 0; begin < width; begin += kSmallTChunkTokens) {
+                rerouted =
+                    std::max(rerouted, chunk_capacity(std::min(kSmallTChunkTokens, width - begin)));
+            }
+            return rerouted;
+        }
         if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
@@ -413,8 +426,19 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(v, op, "v");
 
     auto scope = workspace.scope();
-    const detail::GqaAttentionRoute route =
+    detail::GqaAttentionRoute route =
         detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+    // Speculative verification always supplies valid_columns; prefill passes a null tensor.
+    // resolve_route sends a single-row block of width>=7 to the Prompt prefill route unless
+    // q_heads == 16, so the 27B text stack (24 q_heads) ran every verify block of width>=7
+    // through a prefill kernel whose contract is dense sequential prompt tokens, not a masked
+    // speculative block. That produced wrong target argmax tokens for every draft window
+    // k>=6 while k<=5 (width<=6, SmallT) stayed exact. Keep prefill on Prompt; route masked
+    // verify blocks to the chunked decode path.
+    if (route == detail::GqaAttentionRoute::Prompt && valid_columns.data != nullptr &&
+        width <= kMaximumVerifyTokens) {
+        route = detail::GqaAttentionRoute::ChunkedSmallT;
+    }
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);

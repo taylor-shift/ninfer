@@ -7,13 +7,17 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <optional>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 struct DFlashPersistentState {
     CyclicKVCache local;
     CyclicKVCache rewrite_checkpoint_local;
-    qwen3_6::PagedKVCache full;
+    // Engaged exactly when the drafter has a full-attention layer
+    // (DFlashConfig::local_layers < DFlashConfig::layers); a pure-SWA drafter allocates no
+    // dflash.full pool, so the member stays disengaged and full_batch_layer is dead code.
+    std::optional<qwen3_6::PagedKVCache> full;
     Tensor prefill_features;
     Tensor prefill_positions;
     Tensor pending_features;

@@ -485,6 +485,51 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
     out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
+    const artifact::TensorPlacement dflash_placement =
+        features.dflash() ? artifact::TensorPlacement::Device
+                          : artifact::TensorPlacement::ValidateOnly;
+    const auto bind_dflash = [&](std::string_view name, NumericFormat format,
+                                 std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor(binder, name, format, shape, dflash_placement);
+    };
+    out.dflash.feature_projection =
+        bind_dflash("dflash/feature_projection", NumericFormat::W8G32_F16S, {5120, 25600});
+    out.dflash.context_norm = bind_dflash("dflash/context_norm", NumericFormat::BF16, {5120});
+    for (std::size_t layer = 0; layer < kDFlashLayers; ++layer) {
+        DFlashLayerPlan& target   = out.dflash.layers[layer];
+        const std::string prefix  = "dflash/layers/" + std::to_string(layer) + "/";
+        target.input_norm         = bind_dflash(prefix + "input_norm", NumericFormat::BF16, {5120});
+        target.query_key_value    = bind_dflash(prefix + "attention/query_key_value",
+                                                NumericFormat::W8G32_F16S, {6144, 5120});
+        target.query_norm         = bind_dflash(prefix + "attention/query_norm",
+                                                NumericFormat::BF16, {128});
+        target.key_norm           = bind_dflash(prefix + "attention/key_norm",
+                                                NumericFormat::BF16, {128});
+        target.attention_output   = bind_dflash(prefix + "attention/output",
+                                                NumericFormat::W8G32_F16S, {5120, 4096});
+        target.post_attention_norm =
+            bind_dflash(prefix + "post_attention_norm", NumericFormat::BF16, {5120});
+        target.gate_up =
+            bind_dflash(prefix + "mlp/gate_up", NumericFormat::W8G32_F16S, {34816, 5120});
+        target.down    = bind_dflash(prefix + "mlp/down", NumericFormat::W8G32_F16S, {5120, 17408});
+        target.attention_conv.base_kernel =
+            bind_dflash(prefix + "attention_conv/base_kernel", NumericFormat::BF16, {2, 2, 5120});
+        target.attention_conv.kernel_projection =
+            bind_dflash(prefix + "attention_conv/kernel_projection", NumericFormat::BF16,
+                        {1280, 5120});
+        target.mlp_conv.base_kernel =
+            bind_dflash(prefix + "mlp_conv/base_kernel", NumericFormat::BF16, {2, 2, 5120});
+        target.mlp_conv.kernel_projection =
+            bind_dflash(prefix + "mlp_conv/kernel_projection", NumericFormat::BF16, {1280, 5120});
+    }
+    out.dflash.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {5120});
+    out.dflash.selector.predecessor_codebook =
+        bind_dflash("dflash/selector/predecessor_codebook", NumericFormat::BF16, {248320, 256});
+    out.dflash.selector.successor_codebook =
+        bind_dflash("dflash/selector/successor_codebook", NumericFormat::BF16, {248320, 256});
+    out.dflash.selector.hidden_projection =
+        bind_dflash("dflash/selector/hidden_projection", NumericFormat::BF16, {256, 5120});
+
     load_plan.materialization = binder.finish();
     return load_plan;
 }
@@ -590,6 +635,55 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                                NumericFormat::W8G32_F16S, 5120, 4608);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
                                                                NumericFormat::BF16, {5120});
+    }
+
+    if (plan.features.dflash()) {
+        DFlashWeights& target    = runtime.dflash.emplace();
+        target.feature_projection = artifact::materialized_weight(
+            backing, plan.dflash.feature_projection, NumericFormat::W8G32_F16S, 5120, 25600);
+        target.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
+                                                            NumericFormat::BF16, {5120});
+        for (std::size_t layer = 0; layer < kDFlashLayers; ++layer) {
+            const DFlashLayerPlan& source = plan.dflash.layers[layer];
+            DFlashLayerWeights& weights   = target.layers[layer];
+            weights.input_norm     = artifact::materialized_tensor(backing, source.input_norm,
+                                                                   NumericFormat::BF16, {5120});
+            weights.query_key_value = artifact::materialized_weight(
+                backing, source.query_key_value, NumericFormat::W8G32_F16S, 6144, 5120);
+            weights.context_key   = row_view(weights.query_key_value, 4096, 1024);
+            weights.context_value = row_view(weights.query_key_value, 5120, 1024);
+            weights.query_norm    = artifact::materialized_tensor(backing, source.query_norm,
+                                                                   NumericFormat::BF16, {128});
+            weights.key_norm =
+                artifact::materialized_tensor(backing, source.key_norm, NumericFormat::BF16, {128});
+            weights.attention_output = artifact::materialized_weight(
+                backing, source.attention_output, NumericFormat::W8G32_F16S, 5120, 4096);
+            weights.post_attention_norm = artifact::materialized_tensor(
+                backing, source.post_attention_norm, NumericFormat::BF16, {5120});
+            weights.gate_up = artifact::materialized_weight(backing, source.gate_up,
+                                                            NumericFormat::W8G32_F16S, 34816, 5120);
+            weights.down    = artifact::materialized_weight(backing, source.down,
+                                                            NumericFormat::W8G32_F16S, 5120, 17408);
+            weights.attention_conv.base_kernel =
+                artifact::materialized_tensor(backing, source.attention_conv.base_kernel,
+                                              NumericFormat::BF16, {2, 2, 5120});
+            weights.attention_conv.kernel_projection = artifact::materialized_weight(
+                backing, source.attention_conv.kernel_projection, NumericFormat::BF16, 1280, 5120);
+            weights.mlp_conv.base_kernel = artifact::materialized_tensor(
+                backing, source.mlp_conv.base_kernel, NumericFormat::BF16, {2, 2, 5120});
+            weights.mlp_conv.kernel_projection = artifact::materialized_weight(
+                backing, source.mlp_conv.kernel_projection, NumericFormat::BF16, 1280, 5120);
+        }
+        target.final_norm = artifact::materialized_tensor(backing, plan.dflash.final_norm,
+                                                          NumericFormat::BF16, {5120});
+        target.selector.predecessor_codebook =
+            artifact::materialized_tensor(backing, plan.dflash.selector.predecessor_codebook,
+                                          NumericFormat::BF16, {248320, 256});
+        target.selector.successor_codebook =
+            artifact::materialized_tensor(backing, plan.dflash.selector.successor_codebook,
+                                          NumericFormat::BF16, {248320, 256});
+        target.selector.hidden_projection = artifact::materialized_weight(
+            backing, plan.dflash.selector.hidden_projection, NumericFormat::BF16, 256, 5120);
     }
 }
 

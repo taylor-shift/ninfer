@@ -47,17 +47,19 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 } // namespace
 
-SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelope) {
+SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelope,
+                         std::uint32_t window) {
     if (tokens < 1 || tokens > 16) { throw std::invalid_argument("swa plan: T must be 1..16"); }
     if (envelope.min_context > envelope.max_context) {
         throw std::invalid_argument("swa plan: invalid envelope");
     }
+    if (window < 2) { throw std::invalid_argument("swa plan: invalid window"); }
     // Graph envelopes whose longest context fits three key tiles avoid the second kernel and
     // workspace round trip. At four tiles, split-KV is already faster for every qualified T.
     constexpr std::uint32_t direct_context_limit = 96;
     const bool direct                            = envelope.max_context <= direct_context_limit;
     constexpr std::int32_t key_block             = 32;
-    const std::uint32_t context_rows             = std::min(envelope.max_context, 4095u);
+    const std::uint32_t context_rows             = std::min(envelope.max_context, window - 1);
     const std::int32_t context_tiles =
         static_cast<std::int32_t>((context_rows + key_block - 1u) / key_block);
     constexpr std::int32_t split_limit = 32;
@@ -80,11 +82,12 @@ const char* swa_route_name(SwaRoute route) {
     return "unknown";
 }
 
-void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
-                const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
-                float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
-                Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                cudaStream_t stream) {
+template <int SwaWindow>
+void swa_launch_for_window(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                           const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
+                           float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
+                           Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                           cudaStream_t stream) {
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         const bool direct = plan.route == SwaRoute::Direct;
         if (plan.warps != Warps || plan.split_capacity < 1 ||
@@ -96,7 +99,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
             2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
         if (direct) {
             const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, q.ne[3]);
-            swa_split_partial_kernel<Tokens, Warps, KeyBlock, true>
+            swa_split_partial_kernel<Tokens, Warps, KeyBlock, true, SwaWindow>
                 <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(query_k.data),
@@ -115,7 +118,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
         }
 
         const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
-        swa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
+        swa_split_partial_kernel<Tokens, Warps, KeyBlock, false, SwaWindow>
             <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(query_k.data),
@@ -134,7 +137,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
         constexpr int ReduceWarps = 1;
         constexpr int ReduceRows  = kBidirectionalGqaQHeads * Tokens;
         const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
-        swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
+        swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps, SwaWindow>
             <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),
                 static_cast<const float*>(partial_m.data),
@@ -144,6 +147,28 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     });
+}
+
+void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
+                const Tensor& positions, const Tensor& valid_columns, const Tensor& lanes,
+                float scale, const CyclicKVCacheLayerView& context, const SwaPlan& plan,
+                Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                cudaStream_t stream) {
+    // Registered cyclic windows: 4096 (Qwen3.6 35B drafter) and 2048 (Qwen3.8-27B
+    // DFlash 2 drafter). The window must match the cyclic cache layout, which the
+    // slot-mask kernel instantiations below assume (power-of-two window).
+    switch (context.capacity) {
+    case 2048:
+        swa_launch_for_window<2048>(q, query_k, query_v, positions, valid_columns, lanes, scale,
+                                    context, plan, partial_acc, partial_m, partial_l, out, stream);
+        return;
+    case 4096:
+        swa_launch_for_window<4096>(q, query_k, query_v, positions, valid_columns, lanes, scale,
+                                    context, plan, partial_acc, partial_m, partial_l, out, stream);
+        return;
+    default:
+        throw std::invalid_argument("swa: unsupported cyclic window");
+    }
 }
 
 } // namespace ninfer::ops::detail

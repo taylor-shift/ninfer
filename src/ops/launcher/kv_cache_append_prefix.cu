@@ -51,12 +51,13 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
     const auto* pos     = static_cast<const std::int32_t*>(positions.data);
     const auto* count   = static_cast<const std::int32_t*>(counts.data);
     const auto* lane    = static_cast<const std::int32_t*>(lanes.data);
-    const int padded    = static_cast<int>(cache.padded_capacity);
+    const int padded = static_cast<int>(cache.padded_capacity);
+    const int window = static_cast<int>(cache.capacity);
 
     const dim3 grid(1 + (plan.max_count - 1) / 4, k.ne[3], 1);
     kv_cache_append_prefix_cyclic_kernel<<<grid, kBlock, 0, stream>>>(
         input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
-        plan.tokens, padded);
+        plan.tokens, padded, window);
     CUDA_CHECK(cudaGetLastError());
 }
 

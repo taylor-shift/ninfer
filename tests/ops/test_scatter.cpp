@@ -186,6 +186,73 @@ int batch_prefix_case() {
     return failures;
 }
 
+// The DFlash 2 batch feature sink calls scatter_bf16_batch once per captured target layer
+// with a ROW-SLICED destination view (slice(0, layer*rows, rows) of a [layers*rows, W, C]
+// pending-feature pool) at the drafter's real block width. The B=2 case above uses width 3
+// and a dense unsliced pool, so neither the sliced row stride nor width 8 was covered.
+int batch_row_sliced_case(std::int32_t width) {
+    constexpr std::int32_t rows     = 8;   // per-layer feature rows (D)
+    constexpr std::int32_t layers   = 5;   // 27B DFlash 2 captures five target layers
+    constexpr std::int32_t batch    = 2;
+    constexpr std::int32_t capacity = 3;   // lane capacity (C)
+    const std::int32_t pool_rows    = rows * layers;
+    const std::vector<std::int32_t> lanes{2, 0};
+    // Row 0 leaves a partial tail (columns >= valid must stay unchanged), row 1 is full.
+    const std::vector<std::int32_t> valid{width - 2, width};
+
+    const auto initial = bit_pattern(
+        static_cast<std::size_t>(pool_rows * width * capacity), 0x5a5a'1234u);
+    auto expected_pool = initial;
+
+    std::vector<std::vector<std::uint16_t>> sources;
+    sources.reserve(static_cast<std::size_t>(layers));
+    for (std::int32_t layer = 0; layer < layers; ++layer) {
+        sources.push_back(bit_pattern(static_cast<std::size_t>(rows * width * batch),
+                                      0x1111'0000u + static_cast<std::uint32_t>(layer) * 0x2468u));
+        const auto& source = sources.back();
+        for (std::int32_t b = 0; b < batch; ++b) {
+            for (std::int32_t column = 0; column < valid[static_cast<std::size_t>(b)]; ++column) {
+                for (std::int32_t row = 0; row < rows; ++row) {
+                    // Destination element (layer*rows + row, column, lane) in the dense pool.
+                    const std::size_t destination_index =
+                        static_cast<std::size_t>(lanes[static_cast<std::size_t>(b)]) *
+                            static_cast<std::size_t>(pool_rows) * width +
+                        static_cast<std::size_t>(column) * pool_rows +
+                        static_cast<std::size_t>(layer * rows + row);
+                    expected_pool[destination_index] =
+                        source[static_cast<std::size_t>(b * width + column) * rows + row];
+                }
+            }
+        }
+    }
+
+    DeviceBuffer device_lanes = to_device(lanes);
+    DeviceBuffer device_valid = to_device(valid);
+    GuardedDeviceBuffer device_pool(initial.size() * sizeof(std::uint16_t));
+    device_pool.copy_from_host(initial.data(), initial.size() * sizeof(std::uint16_t));
+
+    Tensor lanes_tensor(device_lanes.p, DType::I32, {batch});
+    Tensor valid_tensor(device_valid.p, DType::I32, {batch});
+    Tensor pool_tensor(device_pool.data(), DType::BF16, {pool_rows, width, capacity});
+
+    std::vector<DeviceBuffer> device_sources;
+    device_sources.reserve(static_cast<std::size_t>(layers));
+    for (std::int32_t layer = 0; layer < layers; ++layer) {
+        device_sources.push_back(to_device(sources[static_cast<std::size_t>(layer)]));
+        Tensor source_tensor(device_sources.back().p, DType::BF16, {rows, width, batch});
+        Tensor target = pool_tensor.slice(0, layer * rows, rows);
+        ops::scatter_bf16_batch(source_tensor, lanes_tensor, valid_tensor, target, nullptr);
+    }
+    cuda_synchronize();
+
+    const std::string label = "scatter_bf16_batch row-sliced W=" + std::to_string(width);
+    int failures = verify_exact(
+        (label + " pool").c_str(),
+        from_device<std::uint16_t>(device_pool.data(), expected_pool.size()), expected_pool);
+    failures += device_pool.verify_guards((label + " guards").c_str());
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -200,6 +267,10 @@ int main() {
     failures += extract_case(10240, 6144, 4096, 6);
     failures += extract_case(8192, 2048, 2048, 1);
     failures += batch_prefix_case();
+    // DFlash 2 27B propose widths (k+1 for k=1..7) through the row-sliced sink geometry.
+    for (const std::int32_t width : {2, 3, 6, 7, 8}) {
+        failures += batch_row_sliced_case(width);
+    }
     std::cout << (failures ? "FAIL" : "OK") << " scatter and extract_bf16_columns\n";
     return failures ? 1 : 0;
 }

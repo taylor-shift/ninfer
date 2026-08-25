@@ -57,6 +57,11 @@ struct OptimizedProposalWeights {
     Tensor token_ids;
 };
 
+struct DFlashConvWeights {
+    Tensor base_kernel;
+    Weight kernel_projection;
+};
+
 struct DFlashLayerWeights {
     Tensor input_norm;
     Weight query_key_value;
@@ -68,6 +73,14 @@ struct DFlashLayerWeights {
     Tensor post_attention_norm;
     Weight gate_up;
     Weight down;
+    DFlashConvWeights attention_conv;
+    DFlashConvWeights mlp_conv;
+};
+
+struct DFlashSelectorWeights {
+    Tensor predecessor_codebook;
+    Tensor successor_codebook;
+    Weight hidden_projection;
 };
 
 template <std::size_t Layers>
@@ -76,6 +89,7 @@ struct DFlashWeights {
     Tensor context_norm;
     std::array<DFlashLayerWeights, Layers> layers;
     Tensor final_norm;
+    DFlashSelectorWeights selector;
 };
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,

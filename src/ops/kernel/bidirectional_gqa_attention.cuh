@@ -74,11 +74,13 @@ __device__ __forceinline__ void noncausal_gqa_row_to_qt(int row, int kv_head, in
     q_head            = kv_head * kBidirectionalGqaGroup + q_local;
 }
 
-template <bool CyclicSwa, int KeyBlock, int Threads>
+template <bool CyclicSwa, int SwaWindow, int KeyBlock, int Threads>
 __device__ __forceinline__ void
 bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
                              const __nv_bfloat16* query, int key0, int valid_keys, bool query_tile,
                              int kv_head, int context_stride, int physical_page, int tid) {
+    static_assert(SwaWindow > 0 && (SwaWindow & (SwaWindow - 1)) == 0,
+                  "SWA window must be a power of two");
     constexpr int VecsPerRow = kBidirectionalGqaHeadDim / 8;
     constexpr int Page       = 64;
     const std::int64_t paged_base =
@@ -91,7 +93,7 @@ bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
         const int safe_row = live ? row : 0;
         std::int64_t src_index;
         if constexpr (CyclicSwa) {
-            const int context_position = (live ? key0 + row : 0) & (kSwaWindow - 1);
+            const int context_position = (live ? key0 + row : 0) & (SwaWindow - 1);
             src_index = query_tile ? bidirectional_gqa_query_kv_index(kv_head, d, safe_row)
                                    : bidirectional_gqa_cyclic_context_index(
                                          kv_head, d, context_position, context_stride);
@@ -107,7 +109,8 @@ bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
     }
 }
 
-template <bool CyclicSwa, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+template <bool CyclicSwa, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
+          int SwaWindow = kSwaWindow>
 __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_state,
@@ -173,7 +176,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         return;
     }
 
-    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_count = CyclicSwa ? min(length, SwaWindow - 1) : length;
     const int context_start = length - context_count;
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
@@ -307,7 +310,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     int current_valid     = 0;
     tile_metadata(0, current_is_query, current_key0, current_valid);
     int current_page = tile_page(current_is_query, current_key0);
-    bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
+    bidirectional_gqa_stage_tile<CyclicSwa, SwaWindow, KeyBlock, Threads>(
         k_s, context_k, query_k, current_key0, current_valid, current_is_query, kv_head,
         context_stride, current_page, tid);
     cp_commit();
@@ -316,7 +319,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         cp_wait<0>();
         __syncthreads();
 
-        bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
+        bidirectional_gqa_stage_tile<CyclicSwa, SwaWindow, KeyBlock, Threads>(
             v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
             context_stride, current_page, tid);
         cp_commit();
@@ -354,7 +357,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
                         ? current_page
                         : tile_page(next_is_query, next_key0);
             }
-            bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
+            bidirectional_gqa_stage_tile<CyclicSwa, SwaWindow, KeyBlock, Threads>(
                 k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head,
                 context_stride, next_page, tid);
             cp_commit();
@@ -370,16 +373,20 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
             const bool row1_live = row1 < RowCount && row1 / kBidirectionalGqaGroup < valid;
             const bool allow00 =
                 row0_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position0 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col0 >= q_position0 - (SwaWindow - 1));
             const bool allow01 =
                 row0_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position0 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col1 >= q_position0 - (SwaWindow - 1));
             const bool allow10 =
                 row1_live && col0 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position1 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col0 >= q_position1 - (SwaWindow - 1));
             const bool allow11 =
                 row1_live && col1 < current_valid &&
-                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position1 - 4095);
+                (!CyclicSwa || current_is_query ||
+                 current_key0 + col1 >= q_position1 - (SwaWindow - 1));
             score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
             score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
             score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;
@@ -534,7 +541,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
         partial_acc, partial_m, partial_l, out);
 }
 
-template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput,
+          int SwaWindow = kSwaWindow>
 __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
@@ -543,13 +551,13 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
     int padded_context, int max_context, int split_capacity, float scale,
     __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
-    noncausal_gqa_split_partial_body<true, Tokens, WarpsPerCta, KeyBlock, DirectOutput>(
+    noncausal_gqa_split_partial_body<true, Tokens, WarpsPerCta, KeyBlock, DirectOutput, SwaWindow>(
         q, query_k, query_v, positions, valid_columns, lanes, context_k, context_v, nullptr,
         padded_context, 0, max_context, split_capacity, scale, partial_acc, partial_m, partial_l,
         out);
 }
 
-template <bool CyclicSwa, int Tokens, int KeyBlock>
+template <bool CyclicSwa, int Tokens, int KeyBlock, int SwaWindow = kSwaWindow>
 __device__ __forceinline__ void
 noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
                           const float* __restrict__ partial_m, const float* __restrict__ partial_l,
@@ -582,7 +590,7 @@ noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
         return;
     }
 
-    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_count = CyclicSwa ? min(length, SwaWindow - 1) : length;
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
     __shared__ float reduce[128];
@@ -642,7 +650,7 @@ __launch_bounds__(128, 2) __global__
                                                        split_capacity, out);
 }
 
-template <int Tokens, int KeyBlock, int WarpsPerBlock>
+template <int Tokens, int KeyBlock, int WarpsPerBlock, int SwaWindow = kSwaWindow>
 __launch_bounds__(WarpsPerBlock * 32, 2) __global__
     void swa_reduce_kernel(const __nv_bfloat16* __restrict__ partial_acc,
                            const float* __restrict__ partial_m, const float* __restrict__ partial_l,
@@ -681,7 +689,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
         }
         return;
     }
-    const int context_count = min(length, kSwaWindow - 1);
+    const int context_count = min(length, SwaWindow - 1);
     const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
 

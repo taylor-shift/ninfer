@@ -220,6 +220,12 @@ ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_grouped_dynamic_conv_test
+  SOURCES ops/test_grouped_dynamic_conv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash_selector_test
+  SOURCES ops/test_dflash_selector.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES ninfer_ops)
@@ -315,3 +321,26 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+# DFlash 2 (Qwen3.8-27B) wave tests: the 27B engine golden test (real NVFP4 fleet artifact,
+# skips with 77 when absent) and the CPU-only linear dispatch shape-coverage contract.
+ninfer_add_test(ninfer_qwen3_8_27b_dflash_real_test
+  SOURCES targets/qwen3_8_27b/test_engine_dflash_real.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_8_27b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_linear_dispatch_test
+  SOURCES ops/test_linear_dispatch.cpp
+  LIBRARIES ninfer_ops)
+
+# DFlash 2 (Qwen3.8-27B) wave: 27B dflash materialization plan test (real NVFP4 fleet artifact
+# with the dflash section, skips with 77 when absent) — 35B dflash load-plan template.
+ninfer_add_test(ninfer_qwen3_8_27b_dflash_load_plan_test
+  SOURCES targets/qwen3_8_27b/test_dflash_load_plan.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_8_27b_dflash_load_plan_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+target_link_libraries(ninfer_qwen3_8_27b_dflash_load_plan_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_dflash_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)

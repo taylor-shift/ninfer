@@ -18,6 +18,11 @@ int main() {
         const int failures = run_profile(
             "LinearSwiGLU W8_A16",
             {QType::W8G32_F16S, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
+        if (failures == 77) {
+            // run_profile returns 77 (skip) without a device; a skip is not a failure.
+            std::cout << "SKIP LinearSwiGLU W8_A16 correctness (no usable CUDA device)\n";
+            return 77;
+        }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU W8_A16 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

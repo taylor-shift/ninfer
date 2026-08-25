@@ -356,6 +356,16 @@ int run_nvfp4() {
     failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
     failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
     failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
+    // 27B DFlash 2 verify widths are k+1 for k=1..7. The B=1 grid above jumps 4 -> 16, so the
+    // production widths 5..8 were untested, dense and with a short valid prefix.
+    for (const std::int32_t width : {5, 6, 7, 8}) {
+        failures += run(width, 1, {}, ops::LinearPolicy::AllowA4,
+                        static_cast<std::uint32_t>(1670U + width));
+        failures += run(width, 1, {width - 1}, ops::LinearPolicy::AllowA4,
+                        static_cast<std::uint32_t>(1680U + width));
+        failures += run(width, 1, {1}, ops::LinearPolicy::AllowA4,
+                        static_cast<std::uint32_t>(1690U + width));
+    }
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }

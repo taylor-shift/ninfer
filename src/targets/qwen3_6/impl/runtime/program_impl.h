@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -531,7 +534,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
                 sequence.mtp_kv_valid = mtp_base;
             } else if (speculative_backend == SpeculativeBackend::DFlash) {
-                if (!dflash || !sequence.kv->backend || sequence.dflash_context_frontier < base) {
+                if (!dflash || (backend_kv_cache() != nullptr && !sequence.kv->backend) ||
+                    sequence.dflash_context_frontier < base) {
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
                 dflash->restore_rewrite_checkpoint(static_cast<std::int32_t>(sequence.lane),
@@ -553,12 +557,16 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
         bind_sequence_kv(sequence);
+        // A pure-SWA DFlash drafter has no paged backend pool (backend_kv_cache() == nullptr):
+        // its context lives in the per-lane local cyclic pool, so nothing backend-side is
+        // materialized. Hybrid drafters and MTP keep their paged reservations.
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
-                                                                : 0U;
+            : speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache() != nullptr
+                ? prompt_tokens
+                : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
@@ -579,12 +587,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.prefix_identity.assign(prompt);
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
-            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
+            if (!dflash || !io.dflash_decode ||
+                (backend_kv_cache() != nullptr && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
             *dflash_host_ingress                         = {};
             dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+            dflash_host_ingress->dflash_kv_table_rows[0] =
+                sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
                                        sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                        device.stream));
@@ -891,20 +901,28 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        return &dflash->full.value();
+    }
     return nullptr;
 }
 
 const qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        return &dflash->full.value();
+    }
     return nullptr;
 }
 
 std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        return sequence.dflash_context_frontier;
+        // The valid backend prefix counts tokens of the drafter's paged full-attention pool.
+        // A pure-SWA drafter has no such pool (backend_kv_cache() == nullptr); its context
+        // frontier tracks the local cyclic pool, which is not paged-KV and never trimmed or
+        // materialized through the sequence bundle.
+        return backend_kv_cache() != nullptr ? sequence.dflash_context_frontier : 0;
     }
     return 0;
 }
@@ -1088,8 +1106,8 @@ void ProgramImplCore::prepare_graphs() {
     reserve_capture_rows(decoder->text_kv, text_capture_allocations, "target KV cache");
     if (speculative_backend == SpeculativeBackend::Mtp) {
         reserve_capture_rows(*decoder->mtp_cache(), mtp_capture_allocations, "MTP KV cache");
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        reserve_capture_rows(dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
+    } else if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        reserve_capture_rows(dflash->full.value(), dflash_capture_allocations, "DFlash Full KV cache");
     }
     device.synchronize();
 
@@ -1145,7 +1163,9 @@ void ProgramImplCore::prepare_graphs() {
         if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
         }
-        if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
+        if (dflash && dflash->full) {
+            zero_capture_pages(dflash->full.value(), dflash_capture_allocations, batch_size);
+        }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
             decoder->linear_attention.zero_slot(
                 LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
@@ -1461,17 +1481,20 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
-        if (!sequence.kv || !sequence.kv->backend || sequence.kv->text.bound_row() < 0 ||
-            sequence.kv->backend->bound_row() < 0 || end64 > capacity) {
+        if (!sequence.kv || (backend_kv_cache() != nullptr && !sequence.kv->backend) ||
+            sequence.kv->text.bound_row() < 0 ||
+            (sequence.kv->backend && sequence.kv->backend->bound_row() < 0) || end64 > capacity) {
             throw std::logic_error("DFlash context append is outside retained target storage");
         }
         dflash_host_ingress->context_frontiers[row] =
             checked_i32(start, "DFlash append context frontier");
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
-        dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+        dflash_host_ingress->dflash_kv_table_rows[row] =
+            sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
         dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(lane);
-        materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
+        materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end),
+                                sequence.kv->backend ? end : 0U);
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
     }
@@ -1693,7 +1716,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("rewrite checkpoint has no complete MTP prefix");
             }
             if (speculative_backend == SpeculativeBackend::DFlash &&
-                (!dflash || !sequence.kv || !sequence.kv->backend ||
+                (!dflash || !sequence.kv ||
+                 (backend_kv_cache() != nullptr && !sequence.kv->backend) ||
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
@@ -2014,8 +2038,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const SequenceState& sequence = sequences[lane];
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
-            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
-            sequence.kv->text.bound_row() < 0 || sequence.kv->backend->bound_row() < 0 ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
+            (backend_kv_cache() != nullptr && !sequence.kv->backend) ||
+            sequence.kv->text.bound_row() < 0 ||
+            (sequence.kv->backend && sequence.kv->backend->bound_row() < 0) ||
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
@@ -2070,10 +2096,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
-            dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+            dflash_host_ingress->dflash_kv_table_rows[row] =
+                sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
+            materialize_sequence_kv(sequence, frontier + extent + 1U,
+                                    sequence.kv->backend ? frontier : 0U);
         }
 
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
@@ -2093,6 +2121,117 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        // Round-level trace (NINFER_DFLASH_TRACE=1): copies the proposal and verification
+        // buffers back to the host so a divergence can be attributed to the drafts, the
+        // target's own argmax, or the acceptance step directly from one round's data.
+        static const bool dflash_trace = [] {
+            const char* value = std::getenv("NINFER_DFLASH_TRACE");
+            return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+        }();
+        if (dflash_trace && io.dflash_decode.has_value()) {
+            const qwen3_6::DFlashDecodeState& frame = *io.dflash_decode;
+            const std::size_t rows                  = lanes.size();
+            std::vector<TokenId> host_drafts(rows * draft_window, 0);
+            std::vector<TokenId> host_verify(rows * width, 0);
+            std::vector<TokenId> host_target(rows * width, 0);
+            CUDA_CHECK(cudaMemcpy(host_drafts.data(), frame.draft_tokens.data,
+                                  host_drafts.size() * sizeof(TokenId), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_verify.data(), frame.verify_ids.data,
+                                  host_verify.size() * sizeof(TokenId), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(host_target.data(), frame.target_argmax.data,
+                                  host_target.size() * sizeof(TokenId), cudaMemcpyDeviceToHost));
+            for (std::size_t row = 0; row < rows; ++row) {
+                std::fprintf(stderr,
+                             "[dflash.trace] lane=%u k=%u width=%u extent=%d accepted=%d "
+                             "licensed=%d anchor=%d frontier=%d\n",
+                             lanes[row], draft_window, width,
+                             dflash_host_ingress->proposal_extents[row],
+                             dflash_host_egress->accepted_drafts[row],
+                             dflash_host_egress->licensed_counts[row],
+                             dflash_host_ingress->anchors[row],
+                             dflash_host_ingress->execution_frontiers[row]);
+                const auto dump = [&](const char* label, const std::vector<TokenId>& data,
+                                      std::uint32_t stride, std::int32_t count) {
+                    std::fprintf(stderr, "[dflash.trace]   %-10s:", label);
+                    for (std::int32_t i = 0; i < count; ++i) {
+                        std::fprintf(stderr, " %d", data[row * stride + static_cast<std::size_t>(i)]);
+                    }
+                    std::fprintf(stderr, "\n");
+                };
+                dump("drafts", host_drafts, draft_window,
+                     static_cast<std::int32_t>(draft_window));
+                // Top-2 logit margin at column 0 (the anchor). Every derived signal (argmax,
+                // hidden checksum, layer sums) differs across block widths even in PASSING
+                // configurations, so none of them separates a real fault from a near-tie.
+                // The margin does: a tie-sized gap means different GEMM tiling merely rounded
+                // the comparison the other way; a wide gap means the column is genuinely wrong.
+                {
+                    const qwen3_6::DFlashDecodeState& f = *io.dflash_decode;
+                    const std::size_t vocab = static_cast<std::size_t>(TextConfig::output_rows);
+                    std::vector<std::uint16_t> col0(vocab, 0);
+                    const std::size_t block = vocab * width;
+                    CUDA_CHECK(cudaMemcpy(col0.data(),
+                                          static_cast<const std::uint8_t*>(f.target_logits.data) +
+                                              row * block * sizeof(std::uint16_t),
+                                          vocab * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+                    const auto to_float = [](std::uint16_t bits) {
+                        const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
+                        float out = 0.0F;
+                        std::memcpy(&out, &widened, sizeof(out));
+                        return out;
+                    };
+                    float best = -3.4e38F, second = -3.4e38F;
+                    std::size_t best_id = 0, second_id = 0;
+                    for (std::size_t i = 0; i < vocab; ++i) {
+                        const float value = to_float(col0[i]);
+                        if (value > best) {
+                            second = best; second_id = best_id;
+                            best = value; best_id = i;
+                        } else if (value > second) {
+                            second = value; second_id = i;
+                        }
+                    }
+                    std::fprintf(stderr,
+                                 "[dflash.margin] col0 top1=%zu (%.6f) top2=%zu (%.6f) "
+                                 "margin=%.6f\n",
+                                 best_id, static_cast<double>(best), second_id,
+                                 static_cast<double>(second),
+                                 static_cast<double>(best - second));
+                }
+                // Per-column checksum of the target's post-stem hidden state. If a column's
+                // argmax differs between draft windows while its checksum matches, the fault
+                // is in the head/argmax; if the checksum already differs, the fault is
+                // upstream in the target stem for that column.
+                {
+                    const qwen3_6::DFlashDecodeState& f = *io.dflash_decode;
+                    const std::size_t hidden_cols =
+                        static_cast<std::size_t>(TextConfig::hidden) * width;
+                    std::vector<std::uint16_t> host_hidden(hidden_cols, 0);
+                    CUDA_CHECK(cudaMemcpy(host_hidden.data(),
+                                          static_cast<const std::uint8_t*>(f.target_hidden.data) +
+                                              row * hidden_cols * sizeof(std::uint16_t),
+                                          hidden_cols * sizeof(std::uint16_t),
+                                          cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr, "[dflash.trace]   hidden_sum:");
+                    for (std::uint32_t col = 0; col < width; ++col) {
+                        std::uint64_t acc = 0;
+                        for (std::int32_t i = 0; i < TextConfig::hidden; ++i) {
+                            acc += host_hidden[static_cast<std::size_t>(col) * TextConfig::hidden +
+                                               static_cast<std::size_t>(i)];
+                        }
+                        std::fprintf(stderr, " %llu",
+                                     static_cast<unsigned long long>(acc));
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                dump("verify_ids", host_verify, width, static_cast<std::int32_t>(width));
+                dump("target_arg", host_target, width, static_cast<std::int32_t>(width));
+                dump("licensed", std::vector<TokenId>(dflash_host_egress->licensed_tokens.begin(),
+                                                      dflash_host_egress->licensed_tokens.end()),
+                     width, dflash_host_egress->licensed_counts[row]);
+            }
+            std::fflush(stderr);
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = sequences[lanes[row]];
             RequestControl& request       = requests[lanes[row]];

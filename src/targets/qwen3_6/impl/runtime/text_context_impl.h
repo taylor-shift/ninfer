@@ -39,6 +39,9 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
@@ -965,6 +968,37 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
+// Per-layer column-0 checksum (NINFER_DFLASH_LAYER_TRACE=1). Column 0 of a verify block is
+// the anchor: causal attention and the GDN recurrence both forbid it from depending on the
+// columns that follow, so its value after every layer must be identical regardless of block
+// width. Printing it for two draft windows locates the first layer where that invariant
+// breaks, without guessing which op is responsible.
+inline void dflash_layer_probe(int layer, const Tensor& x, std::int32_t hidden, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_DFLASH_LAYER_TRACE");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled || x.dtype != DType::BF16 || x.ne[0] != hidden) { return; }
+    // The probe must observe the layer's completed output, so it synchronizes the stream
+    // first. During CUDA graph capture a synchronize/memcpy is illegal, so skip entirely:
+    // run the diagnostic with use_cuda_graph disabled.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
+    std::vector<std::uint16_t> column(static_cast<std::size_t>(hidden), 0);
+    if (cudaMemcpy(column.data(), x.data, column.size() * sizeof(std::uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return;
+    }
+    std::uint64_t acc = 0;
+    for (const std::uint16_t value : column) { acc += value; }
+    std::fprintf(stderr, "[dflash.layer] T=%d layer=%d col0_sum=%llu\n",
+                 static_cast<int>(x.ne[1]), layer, static_cast<unsigned long long>(acc));
+}
+
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
@@ -989,6 +1023,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                if (ph == Phase::Verify) { dflash_layer_probe(layer, x, kCfg.hidden, ctx_.stream); }
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
@@ -1010,6 +1045,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                if (ph == Phase::Verify) { dflash_layer_probe(layer, x, kCfg.hidden, ctx_.stream); }
             }
         }
     }
