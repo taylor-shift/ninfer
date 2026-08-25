@@ -968,13 +968,12 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
-template <class Tap>
 // Per-layer column-0 checksum (NINFER_DFLASH_LAYER_TRACE=1). Column 0 of a verify block is
 // the anchor: causal attention and the GDN recurrence both forbid it from depending on the
 // columns that follow, so its value after every layer must be identical regardless of block
 // width. Printing it for two draft windows locates the first layer where that invariant
 // breaks, without guessing which op is responsible.
-void dflash_layer_probe(int layer, const Tensor& x, std::int32_t hidden, cudaStream_t stream) {
+inline void dflash_layer_probe(int layer, const Tensor& x, std::int32_t hidden, cudaStream_t stream) {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_DFLASH_LAYER_TRACE");
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
@@ -992,6 +991,7 @@ void dflash_layer_probe(int layer, const Tensor& x, std::int32_t hidden, cudaStr
     (void)stream;
 }
 
+template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
