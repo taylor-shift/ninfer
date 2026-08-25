@@ -492,8 +492,15 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 const char* value = std::getenv("NINFER_DFLASH_CTXDUMP");
                 return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
             }();
+            // Round 1 legitimately has count=0 (prefill already supplied those features),
+            // so skip to the configurable round; default 3.
+            static const int target_round = [] {
+                const char* value = std::getenv("NINFER_DFLASH_CTXROUND");
+                return value != nullptr ? std::atoi(value) : 3;
+            }();
+            static int seen = 0;
             static bool written = false;
-            if (dump && !written && batch_size == 1) {
+            if (dump && !written && batch_size == 1 && ++seen >= target_round) {
                 written = true;
                 const std::int32_t rows = Variant::DFlashConfig::feature_rows;
                 std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * width);
