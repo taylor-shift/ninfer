@@ -2160,6 +2160,44 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 };
                 dump("drafts", host_drafts, draft_window,
                      static_cast<std::int32_t>(draft_window));
+                // Top-2 logit margin at column 0 (the anchor). Every derived signal (argmax,
+                // hidden checksum, layer sums) differs across block widths even in PASSING
+                // configurations, so none of them separates a real fault from a near-tie.
+                // The margin does: a tie-sized gap means different GEMM tiling merely rounded
+                // the comparison the other way; a wide gap means the column is genuinely wrong.
+                {
+                    const qwen3_6::DFlashDecodeState& f = *io.dflash_decode;
+                    const std::size_t vocab = static_cast<std::size_t>(TextConfig::output_rows);
+                    std::vector<std::uint16_t> col0(vocab, 0);
+                    const std::size_t block = vocab * width;
+                    CUDA_CHECK(cudaMemcpy(col0.data(),
+                                          static_cast<const std::uint8_t*>(f.target_logits.data) +
+                                              row * block * sizeof(std::uint16_t),
+                                          vocab * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+                    const auto to_float = [](std::uint16_t bits) {
+                        const std::uint32_t widened = static_cast<std::uint32_t>(bits) << 16;
+                        float out = 0.0F;
+                        std::memcpy(&out, &widened, sizeof(out));
+                        return out;
+                    };
+                    float best = -3.4e38F, second = -3.4e38F;
+                    std::size_t best_id = 0, second_id = 0;
+                    for (std::size_t i = 0; i < vocab; ++i) {
+                        const float value = to_float(col0[i]);
+                        if (value > best) {
+                            second = best; second_id = best_id;
+                            best = value; best_id = i;
+                        } else if (value > second) {
+                            second = value; second_id = i;
+                        }
+                    }
+                    std::fprintf(stderr,
+                                 "[dflash.margin] col0 top1=%zu (%.6f) top2=%zu (%.6f) "
+                                 "margin=%.6f\n",
+                                 best_id, static_cast<double>(best), second_id,
+                                 static_cast<double>(second),
+                                 static_cast<double>(best - second));
+                }
                 // Per-column checksum of the target's post-stem hidden state. If a column's
                 // argmax differs between draft windows while its checksum matches, the fault
                 // is in the head/argmax; if the checksum already differs, the fault is
