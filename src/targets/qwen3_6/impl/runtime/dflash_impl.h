@@ -1,6 +1,10 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
@@ -477,6 +481,47 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                    state.execution.device.stream);
         append_context_impl<Variant>(state, compact_features, append_positions, append_counts,
                                      lanes, dflash_rows, envelopes.append);
+
+        // NINFER_DFLASH_CTXDUMP=1: write the drafter's context inputs for one round so a
+        // PyTorch reference run of the same checkpoint can be compared stage by stage.
+        // Engine acceptance is ~1.1 drafts/step against a published ~4.8 while every op
+        // passes its own unit test, so the open question is whether the drafter's forward
+        // reproduces the reference at all on identical inputs.
+        {
+            static const bool dump = [] {
+                const char* value = std::getenv("NINFER_DFLASH_CTXDUMP");
+                return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+            }();
+            static bool written = false;
+            if (dump && !written && batch_size == 1) {
+                written = true;
+                const std::int32_t rows = Variant::DFlashConfig::feature_rows;
+                std::vector<std::uint16_t> host(static_cast<std::size_t>(rows) * width);
+                CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
+                CUDA_CHECK(cudaMemcpy(host.data(), compact_features.data,
+                                      host.size() * sizeof(std::uint16_t),
+                                      cudaMemcpyDeviceToHost));
+                std::vector<std::int32_t> pos(static_cast<std::size_t>(width));
+                CUDA_CHECK(cudaMemcpy(pos.data(), append_positions.data,
+                                      pos.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+                std::vector<std::int32_t> counts(1);
+                CUDA_CHECK(cudaMemcpy(counts.data(), append_counts.data, sizeof(std::int32_t),
+                                      cudaMemcpyDeviceToHost));
+                std::FILE* f = std::fopen("/mnt/f/dflash2-ctx.bin", "wb");
+                if (f != nullptr) {
+                    const std::int32_t header[4] = {rows, width, counts[0],
+                                                    static_cast<std::int32_t>(k)};
+                    std::fwrite(header, sizeof(std::int32_t), 4, f);
+                    std::fwrite(pos.data(), sizeof(std::int32_t), pos.size(), f);
+                    std::fwrite(host.data(), sizeof(std::uint16_t), host.size(), f);
+                    std::fclose(f);
+                    std::fprintf(stderr,
+                                 "[dflash.ctxdump] rows=%d width=%d count=%d k=%d -> "
+                                 "/mnt/f/dflash2-ctx.bin\n",
+                                 rows, width, counts[0], static_cast<int>(k));
+                }
+            }
+        }
 
         propose_batch_impl<Variant>(state, frame, batch_size, k, envelopes);
         ops::speculative_prepare_verify_ids(anchors, drafts, extents, verify_ids,
