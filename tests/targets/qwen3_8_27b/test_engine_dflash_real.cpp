@@ -317,6 +317,35 @@ int main() {
 
     // Diagnostic matrix (env-gated): isolates which engine dimension breaks greedy
     // route-invariance when the full fixture reports a licensed-output divergence.
+    // NINFER_DFLASH_ONE=<k>: build exactly ONE dflash engine at that draft window and
+    // compare against the ordinary baseline. The full matrix below constructs eleven
+    // engines (23 GB artifact each), which made every question cost ~6 minutes; a single
+    // config answers most questions in well under one.
+    if (const char* one = std::getenv("NINFER_DFLASH_ONE")) {
+        const auto probe_k = static_cast<std::uint32_t>(std::atoi(one));
+        auto options = dflash_engine_options(artifact.c_str(), ninfer::ProposalHead::Full, 4352);
+        options.speculative.draft_tokens = probe_k;
+        if (std::getenv("NINFER_DFLASH_NOGRAPH") != nullptr) { options.use_cuda_graph = false; }
+        ninfer::Engine probe(std::move(options));
+        const ninfer::GenerationResult result =
+            probe.generate(probe.prepare_tokens(prompt), greedy_options(24, false));
+        const auto mismatch =
+            std::mismatch(result.generated_token_ids.begin(), result.generated_token_ids.end(),
+                          target_output.begin(), target_output.end());
+        const long first = mismatch.first == result.generated_token_ids.end()
+                               ? -1
+                               : static_cast<long>(mismatch.first -
+                                                   result.generated_token_ids.begin());
+        std::cerr << "[one] k=" << probe_k << " first_mismatch=" << first
+                  << " rounds=" << result.speculative.rounds
+                  << " accepted=" << result.speculative.accepted_tokens << "\n[one] stream:";
+        for (const ninfer::TokenId token : result.generated_token_ids) {
+            std::cerr << ' ' << token;
+        }
+        std::cerr << '\n';
+        return first == -1 ? 0 : 1;
+    }
+
     if (std::getenv("NINFER_DFLASH_DIAG") != nullptr) {
         const auto compare = [&](const char* label, ninfer::EngineOptions options) {
             ninfer::Engine probe(std::move(options));
