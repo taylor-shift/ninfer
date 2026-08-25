@@ -979,6 +979,15 @@ inline void dflash_layer_probe(int layer, const Tensor& x, std::int32_t hidden, 
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }();
     if (!enabled || x.dtype != DType::BF16 || x.ne[0] != hidden) { return; }
+    // The probe must observe the layer's completed output, so it synchronizes the stream
+    // first. During CUDA graph capture a synchronize/memcpy is illegal, so skip entirely:
+    // run the diagnostic with use_cuda_graph disabled.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { return; }
     std::vector<std::uint16_t> column(static_cast<std::size_t>(hidden), 0);
     if (cudaMemcpy(column.data(), x.data, column.size() * sizeof(std::uint16_t),
                    cudaMemcpyDeviceToHost) != cudaSuccess) {
@@ -988,7 +997,6 @@ inline void dflash_layer_probe(int layer, const Tensor& x, std::int32_t hidden, 
     for (const std::uint16_t value : column) { acc += value; }
     std::fprintf(stderr, "[dflash.layer] T=%d layer=%d col0_sum=%llu\n",
                  static_cast<int>(x.ne[1]), layer, static_cast<unsigned long long>(acc));
-    (void)stream;
 }
 
 template <class Tap>
