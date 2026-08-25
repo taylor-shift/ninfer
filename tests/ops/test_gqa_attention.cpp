@@ -1117,8 +1117,12 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
 // and compares the shared six columns. The 27B DFlash 2 engine diverges exactly here: at
 // draft window k=7 (width 8) the target's argmax changes for a first-chunk column that has
 // identical inputs at k=5 (width 6).
+// valid_override < 0 means "every column live" (valid == width). A positive value pins the
+// SAME live column count into both runs, so the only difference is the physical block width:
+// that separates a content effect (extra live columns changing the result) from a pure
+// tiling/reduction-order effect (identical live content, different physical T).
 int run_chunk_invariance_case(const Geometry& geometry, DType dtype, std::int32_t context,
-                              std::uint32_t seed) {
+                              std::uint32_t seed, std::int32_t valid_override = -1) {
     constexpr std::int32_t kNarrow = 6;
     constexpr std::int32_t kWide   = 8;
     const std::size_t q_column_elements  = static_cast<std::size_t>(kHeadDim) * geometry.q_heads;
@@ -1151,7 +1155,9 @@ int run_chunk_invariance_case(const Geometry& geometry, DType dtype, std::int32_
             v_bits.begin(), v_bits.begin() + static_cast<std::ptrdiff_t>(kv_column_elements * columns)));
         DeviceBuffer dp  = to_device(std::vector<std::int32_t>(
             positions.begin(), positions.begin() + width));
-        DeviceBuffer dvalid = to_device(std::vector<std::int32_t>{width});
+        const std::int32_t live =
+            valid_override < 0 ? width : std::min(valid_override, width);
+        DeviceBuffer dvalid = to_device(std::vector<std::int32_t>{live});
         DeviceBuffer drows  = to_device(std::vector<std::int32_t>{0});
         GuardedDeviceBuffer dout(q_column_elements * columns * sizeof(std::uint16_t));
         dout.fill(0xcd);
@@ -1180,9 +1186,13 @@ int run_chunk_invariance_case(const Geometry& geometry, DType dtype, std::int32_
     const std::vector<double> wide   = run_width(kWide);
 
     const std::string label = std::string("gqa_attention chunk invariance ") + geometry.name + " " +
-                              cache_name(dtype) + " context=" + std::to_string(context);
+                              cache_name(dtype) + " context=" + std::to_string(context) +
+                              (valid_override < 0 ? " valid=full"
+                                                  : " valid=" + std::to_string(valid_override));
     int failures = 0;
-    for (std::int32_t token = 0; token < kNarrow; ++token) {
+    const std::int32_t compare_columns =
+        valid_override < 0 ? kNarrow : std::min(valid_override, kNarrow);
+    for (std::int32_t token = 0; token < compare_columns; ++token) {
         for (std::size_t element = 0; element < q_column_elements; ++element) {
             const std::size_t index = static_cast<std::size_t>(token) * q_column_elements + element;
             if (narrow[index] != wide[index]) {
@@ -1388,6 +1398,9 @@ int run_batch_cases() {
     for (const std::int32_t context : {16, 61, 127}) {
         failures += run_chunk_invariance_case(kGeometries[0], DType::BF16, context,
                                               static_cast<std::uint32_t>(700 + context));
+        // Same live column count in both runs: isolates physical width from content.
+        failures += run_chunk_invariance_case(kGeometries[0], DType::BF16, context,
+                                              static_cast<std::uint32_t>(700 + context), 6);
     }
     return failures;
 }
